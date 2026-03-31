@@ -12,7 +12,7 @@
 # curl from raw.githubusercontent.com. Merge queue checks require `gh` CLI.
 #
 # Usage:
-#   ./audit.sh [--branch master] [--format text|markdown] [--skip-queue]
+#   ./audit.sh [--branch main] [--format text|markdown] [--skip-queue]
 #
 # Environment:
 #   GITHUB_TOKEN  - optional, avoids GitHub API rate limits for raw content
@@ -23,7 +23,7 @@ set -euo pipefail
 # Defaults
 #
 FORMAT="text"
-BRANCH="master"
+BRANCH="main"
 SKIP_QUEUE="false"
 LOCAL_RELEASE=""
 RAW_BASE="https://raw.githubusercontent.com/openshift/release"
@@ -98,12 +98,12 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     -h|--help)
-      echo "Usage: $0 [--branch master] [--format text|markdown] [--skip-queue] [--local <path>]"
+      echo "Usage: $0 [--branch main] [--format text|markdown] [--skip-queue] [--local <path>]"
       echo ""
       echo "Audits Prow merge bot configs across OADP ecosystem repositories."
       echo ""
       echo "Options:"
-      echo "  --branch BRANCH   Branch of openshift/release to fetch from (default: master)"
+      echo "  --branch BRANCH   Branch of openshift/release to fetch from (default: main)"
       echo "  --format FORMAT   Output format: text or markdown (default: text)"
       echo "  --skip-queue      Skip merge queue status check (requires gh CLI)"
       echo "  --local PATH      Use a local openshift/release checkout instead of fetching via curl"
@@ -114,7 +114,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     *)
       echo "Unknown option: $1" >&2
-      echo "Usage: $0 [--branch master] [--format text|markdown] [--skip-queue] [--local <path>]" >&2
+      echo "Usage: $0 [--branch main] [--format text|markdown] [--skip-queue] [--local <path>]" >&2
       exit 1
       ;;
   esac

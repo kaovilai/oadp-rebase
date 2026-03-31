@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OADP Prow Merge Bot Audit</title>
+  <style>
+    :root {
+      --bg: #0d1117; --surface: #161b22; --surface2: #1c2129;
+      --border: #30363d; --text: #c9d1d9; --muted: #8b949e;
+      --red: #f85149; --yellow: #d29922; --green: #3fb950;
+      --blue: #58a6ff; --cyan: #79c0ff;
+      --red-bg: rgba(248,81,73,.12); --yellow-bg: rgba(210,153,34,.12);
+      --green-bg: rgba(63,185,80,.12); --blue-bg: rgba(88,166,255,.12);
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+      background: var(--bg); color: var(--text); line-height: 1.6;
+      padding: 2rem; max-width: 1200px; margin: 0 auto;
+    }
+    a { color: var(--blue); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code { background: var(--surface2); padding: .1em .4em; border-radius: 4px; font-size: .9em; }
+    h1 { font-size: 1.5rem; margin-bottom: .25rem; }
+    .subtitle { color: var(--muted); font-size: .875rem; margin-bottom: 1rem; }
+    .controls {
+      display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; margin-bottom: .25rem;
+    }
+    input[type="password"], select {
+      background: var(--surface); border: 1px solid var(--border); color: var(--text);
+      padding: .4rem .6rem; border-radius: 6px; font-size: .8rem;
+    }
+    input:focus { border-color: var(--blue); outline: none; }
+    button {
+      background: #238636; color: #fff; border: none; padding: .4rem 1rem;
+      border-radius: 6px; cursor: pointer; font-size: .8rem; font-weight: 600;
+    }
+    button:hover { background: #2ea043; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    label { display: flex; align-items: center; gap: .4rem; font-size: .8rem; color: var(--muted); }
+    .hint { font-size: .7rem; color: var(--muted); margin-bottom: 1.5rem; }
+
+    .summary-bar {
+      display: flex; gap: 1.5rem; padding: .75rem 1rem; background: var(--surface);
+      border: 1px solid var(--border); border-radius: 8px; margin-bottom: 1rem; align-items: center;
+    }
+    .summary-item .num { font-size: 1.5rem; font-weight: 700; }
+    .summary-item .lbl { font-size: .7rem; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+    .summary-meta { margin-left: auto; font-size: .75rem; color: var(--muted); text-align: right; }
+
+    .section {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 8px; margin-bottom: .75rem; overflow: hidden;
+    }
+    .section-hdr {
+      padding: .6rem 1rem; font-weight: 600; font-size: .9rem; cursor: pointer;
+      display: flex; align-items: center; justify-content: space-between; user-select: none;
+    }
+    .section-hdr:hover { background: rgba(255,255,255,.02); }
+    .section-hdr .arrow { transition: transform .2s; color: var(--muted); font-size: .7rem; }
+    .section.collapsed .section-body { display: none; }
+    .section.collapsed .arrow { transform: rotate(-90deg); }
+    .section-body { padding: .5rem 1rem; border-top: 1px solid var(--border); }
+    .section-desc { color: var(--muted); font-size: .8rem; margin-bottom: .5rem; }
+    .entry { padding: .35rem 0; border-bottom: 1px solid var(--border); font-size: .8rem; }
+    .entry:last-child { border-bottom: none; }
+    .badge {
+      display: inline-block; padding: .05rem .45rem; border-radius: 4px;
+      font-size: .65rem; font-weight: 700; text-transform: uppercase; vertical-align: middle;
+    }
+    .b-issue { background: var(--red-bg); color: var(--red); }
+    .b-warn { background: var(--yellow-bg); color: var(--yellow); }
+    .b-info { background: var(--blue-bg); color: var(--blue); }
+    .b-ok { background: var(--green-bg); color: var(--green); }
+    .repo { font-weight: 600; color: var(--cyan); }
+    .field { color: var(--muted); }
+    .pr-card {
+      background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+      padding: .6rem; margin: .4rem 0;
+    }
+    .pr-title { font-weight: 600; font-size: .85rem; }
+    .pr-meta { font-size: .75rem; color: var(--muted); margin-top: .15rem; }
+    .pr-checks { margin-top: .4rem; }
+    .chk { display: inline-flex; align-items: center; gap: .2rem; font-size: .75rem; margin: .1rem .3rem; }
+    .progress-msg { color: var(--blue); font-size: .85rem; padding: 1rem; }
+    .none { color: var(--muted); font-style: italic; }
+    @media (max-width: 768px) {
+      body { padding: 1rem; }
+      .controls { flex-direction: column; align-items: stretch; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>OADP Prow Merge Bot Configuration Audit</h1>
+    <div class="subtitle">
+      Audits Prow configs from <a href="https://github.com/openshift/release">openshift/release</a>
+      for OADP ecosystem repositories
+    </div>
+    <div class="controls">
+      <input type="password" id="token" placeholder="GitHub token (optional, raises API rate limit)" size="45">
+      <label>openshift/release branch: <select id="branch"><option value="main">main</option></select></label>
+      <label><input type="checkbox" id="includeQueue" checked> Merge queue</label>
+      <button id="runBtn" onclick="runAudit()">Run Audit</button>
+    </div>
+    <div class="hint">Token stored in sessionStorage only. Required for merge queue checks (GitHub API, 60 req/hr without token).</div>
+  </header>
+  <div id="app"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/js-yaml@4.1.0/dist/js-yaml.min.js"></script>
+  <script>
+'use strict';
+
+// ── Constants ──────────────────────────────────────────────────
+const RAW = 'https://raw.githubusercontent.com/openshift/release';
+const API = 'https://api.github.com';
+const PROW = 'https://prow.ci.openshift.org';
+
+const GROUPS = {
+  'upstream-rebase': {
+    label: 'Upstream Rebase Repos (allow_force_pushes expected)',
+    desc: 'Forks of upstream projects managed by rebasebot. Intentionally allow force pushes and typically lack strict branch protection.',
+    repos: [
+      'openshift/velero','openshift/velero-plugin-for-aws','openshift/velero-plugin-for-legacy-aws',
+      'openshift/velero-plugin-for-gcp','openshift/velero-plugin-for-microsoft-azure',
+      'openshift/velero-plugin-for-csi','openshift/restic',
+    ]
+  },
+  'oadp-owned-openshift': {
+    label: 'OADP-Owned Repos (openshift/ org)',
+    desc: 'Should have enforce_admins, required_approving_review_count: 2, and dismiss_stale_reviews.',
+    repos: [
+      'openshift/oadp-operator','openshift/oadp-must-gather',
+      'openshift/openshift-velero-plugin','openshift/hypershift-oadp-plugin',
+    ]
+  },
+  'oadp-owned-migtools': {
+    label: 'OADP-Owned Repos (migtools/ org)',
+    desc: 'Should have enforce_admins, review count, and dismiss_stale_reviews. List plugins explicitly (no org-level inheritance).',
+    repos: [
+      'migtools/filebrowser','migtools/kubevirt-datamover-controller','migtools/kubevirt-datamover-plugin',
+      'migtools/kubevirt-velero-plugin','migtools/oadp-cli','migtools/oadp-non-admin',
+      'migtools/oadp-vm-file-restore','migtools/udistribution',
+      'migtools/velero-plugin-for-vsm','migtools/volume-snapshot-mover',
+    ]
+  },
+  'no-prow': {
+    label: 'Repos With No Prow Config (Expected)',
+    desc: 'These repos are not in OpenShift CI and should have no prow config.',
+    repos: ['migtools/oadp-vmdp','migtools/kopia']
+  }
+};
+
+const BLOCKER_LABELS = [
+  'do-not-merge/hold','do-not-merge/work-in-progress','do-not-merge/invalid-owners-file',
+  'needs-rebase','jira/invalid-bug','backports/unvalidated-commits',
+];
+
+// ── State ──────────────────────────────────────────────────────
+let cfgs = {};       // { 'org/repo': { plugin: obj|null, prow: obj|null } }
+let results = [];    // { repo, level, msg }
+let counts = { issues: 0, warnings: 0, info: 0 };
+let queue = [];
+
+// ── Helpers ────────────────────────────────────────────────────
+const split = n => { const [o, r] = n.split('/'); return { org: o, repo: r }; };
+const hdrs = () => {
+  const h = { Accept: 'application/vnd.github.v3+json' };
+  const t = document.getElementById('token').value.trim();
+  if (t) h.Authorization = `token ${t}`;
+  return h;
+};
+const log = m => { const el = document.getElementById('progress'); if (el) el.textContent = m; };
+const badge = (cls, txt) => `<span class="badge b-${cls}">${txt || cls}</span>`;
+
+// ── YAML Fetch ─────────────────────────────────────────────────
+async function fetchYaml(url) {
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    return jsyaml.load(await r.text());
+  } catch { return null; }
+}
+
+async function fetchAllConfigs(branch) {
+  const all = Object.values(GROUPS).flatMap(g => g.repos);
+  let done = 0;
+  await Promise.all(all.map(async name => {
+    const { org, repo } = split(name);
+    const base = `${RAW}/${branch}/core-services/prow/02_config/${org}/${repo}`;
+    const [plugin, prow] = await Promise.all([
+      fetchYaml(`${base}/_pluginconfig.yaml`),
+      fetchYaml(`${base}/_prowconfig.yaml`),
+    ]);
+    cfgs[name] = { plugin, prow };
+    log(`Fetching configs... ${++done}/${all.length}`);
+  }));
+}
+
+// ── Config Extraction ──────────────────────────────────────────
+function hasConfig(n) { const c = cfgs[n]; return c && (c.plugin || c.prow); }
+
+function pluginField(n, section, field) {
+  const c = cfgs[n]?.plugin;
+  if (!c) return 'MISSING_FILE';
+  const arr = c[section];
+  if (!Array.isArray(arr)) return 'NOT_SET';
+  for (const e of arr) {
+    if (e.repos?.includes(n) && e[field] !== undefined) return String(e[field]);
+  }
+  return 'NOT_SET';
+}
+
+function hasApproveSection(n) { const c = cfgs[n]?.plugin; return c && Array.isArray(c.approve); }
+function hasLgtmSection(n) { const c = cfgs[n]?.plugin; return c && Array.isArray(c.lgtm); }
+function hasApprovePlugin(n) {
+  const c = cfgs[n]?.plugin;
+  if (!c?.plugins) return false;
+  const rp = c.plugins[n];
+  return rp?.plugins?.includes('approve') || false;
+}
+
+function bpRepo(n) {
+  const c = cfgs[n]?.prow;
+  if (!c) return null;
+  const { org, repo } = split(n);
+  return c?.['branch-protection']?.orgs?.[org]?.repos?.[repo] || null;
+}
+
+function bpField(n, f) {
+  const bp = bpRepo(n);
+  if (!bp) return cfgs[n]?.prow ? 'NOT_SET' : 'MISSING_FILE';
+  if (f === 'enforce_admins') return bp.enforce_admins !== undefined ? String(bp.enforce_admins) : 'NOT_SET';
+  if (f === 'allow_force_pushes') return bp.allow_force_pushes !== undefined ? String(bp.allow_force_pushes) : 'NOT_SET';
+  const rev = bp.required_pull_request_reviews;
+  if (f === 'dismiss_stale_reviews') return rev?.dismiss_stale_reviews !== undefined ? String(rev.dismiss_stale_reviews) : 'NOT_SET';
+  if (f === 'review_count') return rev?.required_approving_review_count !== undefined ? String(rev.required_approving_review_count) : 'NOT_SET';
+  return 'NOT_SET';
+}
+
+function mergeMethod(n) {
+  const c = cfgs[n]?.prow;
+  if (!c) return 'MISSING_FILE';
+  return c?.tide?.merge_method?.[n] || 'NOT_SET';
+}
+
+function tideBranches(n) {
+  const qs = cfgs[n]?.prow?.tide?.queries || [];
+  for (const q of qs) { if (q.repos?.includes(n)) return q.includedBranches || []; }
+  return [];
+}
+
+function tideMissingLabels(n) {
+  const qs = cfgs[n]?.prow?.tide?.queries || [];
+  for (const q of qs) { if (q.repos?.includes(n)) return q.missingLabels || []; }
+  return [];
+}
+
+// ── Audit Logic ────────────────────────────────────────────────
+function add(repo, level, msg) {
+  results.push({ repo, level, msg });
+  if (level === 'issue') counts.issues++;
+  else if (level === 'warn') counts.warnings++;
+  else if (level === 'info') counts.info++;
+}
+
+function auditRepo(name, type) {
+  if (!hasConfig(name)) { add(name, 'issue', 'No prow config found in openshift/release'); return; }
+
+  // Plugin checks
+  if (!hasApproveSection(name)) add(name, 'issue', "Missing top-level 'approve:' config section in _pluginconfig.yaml");
+  if (!hasLgtmSection(name)) add(name, 'issue', "Missing top-level 'lgtm:' config section in _pluginconfig.yaml");
+  if (!hasApprovePlugin(name)) add(name, 'issue', "'approve' not listed in plugins");
+
+  const selfApprove = pluginField(name, 'approve', 'require_self_approval');
+  if (selfApprove === 'MISSING_FILE') add(name, 'issue', '_pluginconfig.yaml not found');
+  else if (selfApprove === 'NOT_SET') add(name, 'warn', 'require_self_approval not explicitly set (defaults vary)');
+  else if (selfApprove !== 'false') add(name, 'info', `require_self_approval=${selfApprove} (most OADP repos use false)`);
+
+  const reviewLgtm = pluginField(name, 'lgtm', 'review_acts_as_lgtm');
+  if (reviewLgtm === 'true') add(name, 'info', 'review_acts_as_lgtm=true (GitHub Approve review counts as /lgtm)');
+
+  // Branch protection
+  const enforce = bpField(name, 'enforce_admins');
+  const reviewCount = bpField(name, 'review_count');
+  const forcePush = bpField(name, 'allow_force_pushes');
+  const dismissStale = bpField(name, 'dismiss_stale_reviews');
+  const mm = mergeMethod(name);
+
+  if (type === 'upstream-rebase') {
+    if (forcePush !== 'true') add(name, 'warn', 'Upstream rebase repo missing allow_force_pushes=true (needed for rebasebot)');
+    else results.push({ repo: name, level: 'ok', msg: 'allow_force_pushes=true (expected for upstream rebase repo)' });
+    if (enforce === 'true') add(name, 'info', 'enforce_admins=true on upstream rebase repo (unusual — may block rebasebot)');
+    if (reviewCount !== 'NOT_SET') add(name, 'info', `required_approving_review_count=${reviewCount} on upstream rebase repo (may block rebasebot PRs)`);
+  } else {
+    if (enforce !== 'true') add(name, 'warn', 'Missing enforce_admins=true — Tide bypasses review count without it (prow#134)');
+    if (reviewCount === 'NOT_SET') add(name, 'warn', 'Missing required_approving_review_count (expected for OADP-owned repo)');
+    else if (reviewCount !== '2') add(name, 'info', `required_approving_review_count=${reviewCount} (most OADP repos use 2)`);
+    if (dismissStale !== 'true') add(name, 'warn', 'Missing dismiss_stale_reviews=true (expected for OADP-owned repo)');
+    if (forcePush === 'true') add(name, 'warn', 'allow_force_pushes=true on OADP-owned repo (unexpected unless rebasebot also manages this repo)');
+  }
+
+  if (mm !== 'NOT_SET' && mm !== 'MISSING_FILE' && mm) add(name, 'info', `merge_method=${mm}`);
+  if (tideMissingLabels(name).includes('keep-main-query-separate'))
+    add(name, 'info', 'Uses keep-main-query-separate label in Tide missingLabels');
+}
+
+// ── Cross-repo comparison ──────────────────────────────────────
+function compareField(fieldName, repos) {
+  const vals = {};
+  for (const r of repos) {
+    if (!hasConfig(r)) continue;
+    switch (fieldName) {
+      case 'require_self_approval': vals[r] = pluginField(r, 'approve', 'require_self_approval'); break;
+      case 'review_acts_as_lgtm': vals[r] = pluginField(r, 'lgtm', 'review_acts_as_lgtm'); break;
+      case 'enforce_admins': vals[r] = bpField(r, 'enforce_admins'); break;
+      case 'review_count': vals[r] = bpField(r, 'review_count'); break;
+      case 'allow_force_pushes': vals[r] = bpField(r, 'allow_force_pushes'); break;
+      case 'dismiss_stale_reviews': vals[r] = bpField(r, 'dismiss_stale_reviews'); break;
+      case 'merge_method': vals[r] = mergeMethod(r); break;
+    }
+  }
+  const freq = {};
+  for (const v of Object.values(vals)) freq[v] = (freq[v] || 0) + 1;
+  const majority = Object.entries(freq).sort((a, b) => b[1] - a[1])[0]?.[0];
+  const outliers = Object.entries(vals).filter(([, v]) => v !== majority);
+  return outliers.length ? { fieldName, majority, outliers } : null;
+}
+
+// ── Merge Queue ────────────────────────────────────────────────
+async function checkMergeQueue(repos) {
+  const out = [];
+  const h = hdrs();
+  for (const name of repos) {
+    if (!hasConfig(name)) continue;
+    log(`Checking merge queue: ${name}...`);
+    try {
+      const resp = await fetch(`${API}/repos/${name}/pulls?state=open&per_page=100`, { headers: h });
+      if (resp.status === 403) { out.push({ repo: name, error: 'Rate limited — provide a GitHub token' }); break; }
+      if (!resp.ok) continue;
+      const prs = await resp.json();
+      const matched = prs.filter(p => {
+        const lbls = p.labels.map(l => l.name);
+        return lbls.includes('approved') && lbls.includes('lgtm');
+      });
+      if (!matched.length) continue;
+
+      const reqReviews = bpField(name, 'review_count');
+      const enforce = bpField(name, 'enforce_admins');
+      const { org, repo } = split(name);
+      const details = [];
+
+      for (const pr of matched) {
+        const [revResp, chkResp, stResp] = await Promise.all([
+          fetch(`${API}/repos/${name}/pulls/${pr.number}/reviews`, { headers: h }),
+          fetch(`${API}/repos/${name}/commits/${pr.head.sha}/check-runs?per_page=100`, { headers: h }),
+          fetch(`${API}/repos/${name}/commits/${pr.head.sha}/status`, { headers: h }),
+        ]);
+        const reviews = revResp.ok ? await revResp.json() : [];
+        const chkData = chkResp.ok ? await chkResp.json() : { check_runs: [] };
+        const stData = stResp.ok ? await stResp.json() : { statuses: [] };
+
+        // Unique approvers
+        const approvers = new Set();
+        for (const rv of reviews) { if (rv.state === 'APPROVED') approvers.add(rv.user.login); }
+
+        // Normalize checks
+        const checks = [];
+        for (const c of chkData.check_runs) {
+          checks.push({
+            name: c.name,
+            state: c.status === 'completed' ? (c.conclusion?.toUpperCase() || 'UNKNOWN')
+                 : c.status === 'in_progress' ? 'IN_PROGRESS' : 'PENDING',
+          });
+        }
+        for (const s of stData.statuses) {
+          checks.push({ name: s.context, state: s.state.toUpperCase() });
+        }
+
+        const failing = checks.filter(c => c.state === 'FAILURE' && c.name !== 'tide');
+        const errored = checks.filter(c => c.state === 'ERROR' && c.name !== 'tide');
+        const pending = checks.filter(c => c.state === 'PENDING' && c.name !== 'tide');
+        const running = checks.filter(c => c.state === 'IN_PROGRESS' && c.name !== 'tide');
+        const tide = checks.find(c => c.name === 'tide');
+        const prLabels = pr.labels.map(l => l.name);
+        const blockerLabels = BLOCKER_LABELS.filter(b => prLabels.includes(b));
+
+        let missingReviews = false, reviewsShort = 0;
+        const reqNum = parseInt(reqReviews);
+        if (!isNaN(reqNum) && enforce === 'true' && approvers.size < reqNum) {
+          missingReviews = true;
+          reviewsShort = reqNum - approvers.size;
+        }
+
+        const hasBlockers = blockerLabels.length > 0 || failing.length > 0 || errored.length > 0
+          || pending.length > 0 || running.length > 0 || missingReviews;
+
+        const encBranch = encodeURIComponent(pr.head.ref);
+        details.push({
+          number: pr.number, title: pr.title, author: pr.user.login,
+          branch: pr.head.ref, base: pr.base.ref, url: pr.html_url, labels: prLabels,
+          blockerLabels, approvalCount: approvers.size,
+          requiredReviews: isNaN(reqNum) ? null : reqNum, enforce,
+          missingReviews, reviewsShort,
+          failing, errored, pending, running,
+          tide: tide?.state || 'NOT_REPORTED', hasBlockers,
+          prowUrl: `${PROW}/pr?query=is%3Apr+repo%3A${org}%2F${repo}+author%3A${pr.user.login}+head%3A${encBranch}`,
+        });
+      }
+
+      out.push({
+        repo: name, count: matched.length, reqReviews, enforce, prs: details,
+        tideUrl: `${PROW}/tide?query=is%3Apr+state%3Aopen+repo%3A${org}%2F${repo}`,
+      });
+    } catch (e) { out.push({ repo: name, error: e.message }); }
+  }
+  return out;
+}
+
+// ── Rendering ──────────────────────────────────────────────────
+function sec(title, desc, content, collapsed) {
+  return `<div class="section${collapsed ? ' collapsed' : ''}">
+    <div class="section-hdr" onclick="this.parentElement.classList.toggle('collapsed')">
+      <span>${title}</span><span class="arrow">&#9660;</span>
+    </div>
+    <div class="section-body">${desc ? `<div class="section-desc">${desc}</div>` : ''}${content}</div>
+  </div>`;
+}
+
+function render() {
+  let h = '';
+  const branch = document.getElementById('branch').value;
+
+  // Summary bar
+  h += `<div class="summary-bar">
+    <div class="summary-item"><div class="num" style="color:var(--red)">${counts.issues}</div><div class="lbl">Issues</div></div>
+    <div class="summary-item"><div class="num" style="color:var(--yellow)">${counts.warnings}</div><div class="lbl">Warnings</div></div>
+    <div class="summary-item"><div class="num" style="color:var(--blue)">${counts.info}</div><div class="lbl">Info</div></div>
+    <div class="summary-meta">Source: openshift/release @ ${branch}<br>${new Date().toISOString()}</div>
+  </div>`;
+
+  // Per-group sections
+  for (const [type, group] of Object.entries(GROUPS)) {
+    let c = '';
+    for (const repo of group.repos) {
+      const entries = results.filter(r => r.repo === repo);
+      if (!entries.length) {
+        if (type === 'no-prow' && !hasConfig(repo))
+          c += `<div class="entry">${badge('ok','OK')} <span class="repo">${repo}</span> No prow config (expected)</div>`;
+        continue;
+      }
+      for (const e of entries)
+        c += `<div class="entry">${badge(e.level, e.level)} <span class="repo">${repo}</span>: ${e.msg}</div>`;
+    }
+    if (!c) c = '<div class="entry none">No findings</div>';
+    h += sec(group.label, group.desc, c, type === 'no-prow');
+  }
+
+  // Cross-repo comparison
+  const compFields = ['require_self_approval','review_acts_as_lgtm','enforce_admins',
+    'review_count','dismiss_stale_reviews','allow_force_pushes','merge_method'];
+
+  for (const [type, group] of Object.entries(GROUPS)) {
+    if (type === 'no-prow') continue;
+    const fields = type === 'upstream-rebase'
+      ? ['require_self_approval','review_acts_as_lgtm','allow_force_pushes','merge_method']
+      : compFields;
+    let c = '';
+    for (const f of fields) {
+      const r = compareField(f, group.repos);
+      if (!r) continue;
+      c += `<div class="entry"><span class="field">${r.fieldName}</span> (majority: <code>${r.majority}</code>)`;
+      for (const [repo, val] of r.outliers)
+        c += `<br>&nbsp;&nbsp;${badge('warn','differs')} <span class="repo">${repo}</span>: <code>${val}</code>`;
+      c += '</div>';
+    }
+    if (!c) c = '<div class="entry" style="color:var(--green)">All repos consistent</div>';
+    h += sec(`Comparison: ${group.label}`, 'Fields where a repo differs from the majority value', c, true);
+  }
+
+  // Tide branch coverage
+  let bc = '';
+  for (const [type, group] of Object.entries(GROUPS)) {
+    if (type === 'no-prow') continue;
+    for (const repo of group.repos) {
+      if (!hasConfig(repo)) continue;
+      const branches = tideBranches(repo);
+      bc += `<div class="entry"><span class="repo">${repo}</span>: `;
+      bc += branches.length
+        ? branches.map(b => `<code>${b}</code>`).join(', ')
+        : `${badge('warn','warn')} No includedBranches (uses excludedBranches or all-branch query)`;
+      bc += '</div>';
+    }
+  }
+  h += sec('Tide Branch Coverage', 'Branches included in Tide merge queries', bc, true);
+
+  // Merge queue
+  if (queue.length) {
+    let qc = '', total = 0;
+    for (const entry of queue) {
+      if (entry.error) {
+        qc += `<div class="entry">${badge('warn','error')} <span class="repo">${entry.repo}</span>: ${entry.error}</div>`;
+        continue;
+      }
+      total += entry.count;
+      qc += `<div class="entry"><span class="repo">${entry.repo}</span> (${entry.count} PRs with approved+lgtm)`;
+      if (entry.reqReviews !== 'NOT_SET' && entry.reqReviews !== 'MISSING_FILE')
+        qc += ` — Required reviews: ${entry.reqReviews} (enforce_admins: ${entry.enforce})`;
+      qc += ` <a href="${entry.tideUrl}" target="_blank">Tide</a>`;
+
+      // Pre-compute review blockers per branch for this repo
+      const reviewBlockersByBranch = {};
+      if (entry.enforce === 'true' && entry.prs[0]?.requiredReviews) {
+        for (const pr of entry.prs) {
+          if (pr.missingReviews && pr.tide === 'SUCCESS') {
+            if (!reviewBlockersByBranch[pr.base]) reviewBlockersByBranch[pr.base] = [];
+            reviewBlockersByBranch[pr.base].push(pr);
+          }
+        }
+      }
+
+      for (const pr of entry.prs) {
+        const color = pr.hasBlockers ? 'var(--red)' : 'var(--green)';
+        qc += `<div class="pr-card">
+          <div class="pr-title" style="color:${color}">
+            <a href="${pr.url}" target="_blank">#${pr.number}</a> [${pr.base}] ${pr.title}
+          </div>
+          <div class="pr-meta">Author: ${pr.author} · <a href="${pr.prowUrl}" target="_blank">Prow</a></div>
+          <div class="pr-checks">`;
+
+        for (const lbl of pr.blockerLabels)
+          qc += `<div class="chk">${badge('issue','BLOCKED')} ${lbl}</div>`;
+
+        if (pr.missingReviews) {
+          qc += `<div class="chk">${badge('issue','REVIEWS')} ${pr.approvalCount}/${pr.requiredReviews} approvals (need ${pr.reviewsShort} more)</div>`;
+          qc += `<div class="chk" style="color:var(--yellow)">Tide will attempt merge but GitHub will reject (enforce_admins + prow#134)</div>`;
+        } else if (pr.requiredReviews !== null) {
+          qc += `<div class="chk">${badge('ok','REVIEWS')} ${pr.approvalCount}/${pr.requiredReviews} approvals</div>`;
+        }
+
+        for (const c of pr.failing) qc += `<div class="chk">${badge('issue','FAILED')} ${c.name}</div>`;
+        for (const c of pr.errored) qc += `<div class="chk">${badge('issue','ERROR')} ${c.name}</div>`;
+        for (const c of pr.running) qc += `<div class="chk">${badge('warn','RUNNING')} ${c.name}</div>`;
+
+        if (pr.pending.length <= 5) {
+          for (const c of pr.pending) qc += `<div class="chk">${badge('warn','PENDING')} ${c.name}</div>`;
+        } else {
+          for (const c of pr.pending.slice(0, 3)) qc += `<div class="chk">${badge('warn','PENDING')} ${c.name}</div>`;
+          qc += `<div class="chk">${badge('warn','PENDING')} ... and ${pr.pending.length - 3} more</div>`;
+        }
+
+        if (pr.tide === 'SUCCESS')
+          qc += `<div class="chk">${badge('ok','TIDE')} merge criteria met — merging soon</div>`;
+        else if (pr.tide === 'PENDING') {
+          // Check if review-blocked PRs ahead on same branch
+          const branchBlockers = (reviewBlockersByBranch[pr.base] || [])
+            .filter(b => b.number !== pr.number)
+            .map(b => `<a href="${b.url}" target="_blank">#${b.number}</a> (needs ${b.reviewsShort} more review(s))`);
+          if (branchBlockers.length)
+            qc += `<div class="chk">${badge('info','TIDE')} waiting — review-blocked PRs ahead: ${branchBlockers.join(', ')}</div>`;
+          else
+            qc += `<div class="chk">${badge('info','TIDE')} waiting (another PR may be testing ahead in queue)</div>`;
+        }
+
+        if (!pr.hasBlockers) {
+          const branchBlockers = (reviewBlockersByBranch[pr.base] || [])
+            .filter(b => b.number !== pr.number)
+            .map(b => `<a href="${b.url}" target="_blank">#${b.number}</a> (needs ${b.reviewsShort} more review(s))`);
+          if (branchBlockers.length)
+            qc += `<div class="chk">${badge('ok','READY')} All checks passed — but review-blocked PRs may delay merge: ${branchBlockers.join(', ')}</div>`;
+          else
+            qc += `<div class="chk">${badge('ok','READY')} All checks passed, no blocking labels — merge imminent</div>`;
+        }
+
+        qc += '</div></div>';
+      }
+      qc += '</div>';
+    }
+    if (total === 0) qc = `<div class="entry">${badge('ok','OK')} No PRs stuck in merge queue</div>`;
+    h += sec('Merge Queue Status', 'PRs with approved+lgtm labels that haven\'t merged yet. Tide merges one PR at a time per branch per repo.', qc);
+  }
+
+  document.getElementById('app').innerHTML = h;
+}
+
+// ── Main ───────────────────────────────────────────────────────
+async function runAudit() {
+  const btn = document.getElementById('runBtn');
+  btn.disabled = true; btn.textContent = 'Running...';
+  document.getElementById('app').innerHTML = '<div id="progress" class="progress-msg">Starting audit...</div>';
+
+  cfgs = {}; results = []; counts = { issues: 0, warnings: 0, info: 0 }; queue = [];
+  const branch = document.getElementById('branch').value;
+  const includeQueue = document.getElementById('includeQueue').checked;
+
+  try {
+    await fetchAllConfigs(branch);
+
+    // No-prow repos
+    for (const repo of GROUPS['no-prow'].repos) {
+      if (hasConfig(repo)) add(repo, 'warn', 'Has prow config but was expected to have none');
+    }
+
+    // Audit each group
+    log('Running audit...');
+    for (const [type, group] of Object.entries(GROUPS)) {
+      if (type === 'no-prow') continue;
+      for (const repo of group.repos) auditRepo(repo, type);
+    }
+
+    // Merge queue
+    if (includeQueue) {
+      const all = Object.entries(GROUPS).filter(([t]) => t !== 'no-prow').flatMap(([,g]) => g.repos);
+      queue = await checkMergeQueue(all);
+    }
+
+    render();
+
+    // Save token
+    const t = document.getElementById('token').value.trim();
+    if (t) sessionStorage.setItem('prow-audit-token', t);
+  } catch (e) {
+    document.getElementById('app').innerHTML = `<div style="color:var(--red)">Error: ${e.message}</div>`;
+  } finally {
+    btn.disabled = false; btn.textContent = 'Run Audit';
+  }
+}
+
+// Restore token
+window.addEventListener('DOMContentLoaded', () => {
+  const saved = sessionStorage.getItem('prow-audit-token');
+  if (saved) document.getElementById('token').value = saved;
+});
+  </script>
+</body>
+</html>

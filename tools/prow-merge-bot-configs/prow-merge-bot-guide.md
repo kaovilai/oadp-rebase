@@ -1,5 +1,7 @@
 # Prow Merge Bot Guide for OADP Repositories
 
+[![Prow Audit Status](https://img.shields.io/endpoint?url=https://oadp-rebasebot.github.io/oadp-rebase/badge.json)](https://github.com/oadp-rebasebot/oadp-rebase/actions/workflows/prow-audit-status.yaml)
+
 How Prow's merge automation (Tide), labeling bots (approve/lgtm plugins), and branch protection work together across OADP ecosystem repositories.
 
 ## Table of Contents
@@ -51,6 +53,8 @@ tide:
     repos:
     - org/repo
 ```
+
+Some repos also use a `keep-main-query-separate` label in their Tide `missingLabels` list, which prevents PRs from being batched in the same Tide merge pool as PRs targeting main/master branches.
 
 ### Merge Methods
 
@@ -307,7 +311,6 @@ For a PR to merge in an OADP repo, it typically needs:
 | **openshift/velero-plugin-for-legacy-aws** | `false` | not set (=false) | yes | yes |
 | **openshift/velero-plugin-for-microsoft-azure** | `false` | not set (=false) | yes | yes |
 | **openshift/hypershift-oadp-plugin** | `false` | **`true`** | yes | yes |
-| **openshift/managed-velero-operator** | **(missing)** | **(missing)** | **no** | yes |
 | **migtools/filebrowser** | `false` | not set (=false) | yes | yes |
 | **migtools/kubevirt-datamover-controller** | `false` | not set (=false) | yes | yes |
 | **migtools/kubevirt-datamover-plugin** | `false` | not set (=false) | yes | yes |
@@ -334,7 +337,6 @@ For a PR to merge in an OADP repo, it typically needs:
 | **openshift/velero-plugin-for-legacy-aws** | not set | not set | `true` (per-branch) | not set |
 | **openshift/velero-plugin-for-microsoft-azure** | not set | not set | `true` (include oadp-*) | not set |
 | **openshift/hypershift-oadp-plugin** | not set | not set | not set | not set |
-| **openshift/managed-velero-operator** | not set | not set | not set | not set |
 | **migtools/filebrowser** | `true` | **`1`** | not set | `true` |
 | **migtools/kubevirt-datamover-controller** | `true` | `2` | not set | `true` |
 | **migtools/kubevirt-datamover-plugin** | `true` | `2` | not set | `true` |
@@ -370,15 +372,11 @@ All other repos require the explicit `/lgtm` comment — a GitHub "Approve" revi
 
 **Impact**: Contributors may submit a GitHub approving review expecting it to count as LGTM, but on most OADP repos it won't. They must also comment `/lgtm`.
 
-#### 2. `openshift/managed-velero-operator` — missing approve/lgtm config
-
-This repo has no `approve:` or `lgtm:` top-level sections in `_pluginconfig.yaml`. It only has `approve` in the plugins list. This means it relies entirely on org-level defaults (if any exist) for approve and lgtm behavior.
-
-#### 3. `migtools/udistribution` — missing `lgtm:` config section
+#### 2. `migtools/udistribution` — missing `lgtm:` config section
 
 Has `lgtm` in its plugin list but no separate `lgtm:` configuration section. The plugin is active but has no repo-specific configuration (e.g., `review_acts_as_lgtm` is not configurable without the section).
 
-#### 4. Branch protection is split into two patterns
+#### 3. Branch protection is split into two patterns
 
 **Pattern A** (rebasebot-managed upstream forks): `allow_force_pushes: true`, no `enforce_admins`, no `required_approving_review_count`
 - velero, velero-plugin-for-aws, velero-plugin-for-gcp, velero-plugin-for-microsoft-azure, restic, velero-plugin-for-csi, velero-plugin-for-legacy-aws
@@ -390,13 +388,13 @@ This split is intentional — Pattern A repos need force pushes for rebasebot to
 
 **Important:** `enforce_admins: true` is required alongside `required_approving_review_count` as a workaround for [kubernetes-sigs/prow#134](https://github.com/kubernetes-sigs/prow/issues/134) — without it, Tide bypasses GitHub's review count requirement. See [Why `enforce_admins` Is Required](#why-enforce_admins-is-required).
 
-#### 5. Inconsistent `required_approving_review_count`
+#### 4. Inconsistent `required_approving_review_count`
 
 Most repos with branch protection require **2** approving reviews, but:
 - `migtools/filebrowser`: requires only **1**
 - `migtools/oadp-vm-file-restore`: requires only **1**
 
-#### 6. Missing Prow config directories
+#### 5. Missing Prow config directories
 
 These repos are in the rebasebot ecosystem but have **no Prow config directory** in `openshift/release`:
 - `migtools/oadp-vmdp`
@@ -404,7 +402,7 @@ These repos are in the rebasebot ecosystem but have **no Prow config directory**
 
 They may not have CI jobs in OpenShift CI at all.
 
-#### 7. Tide branch coverage gaps
+#### 6. Tide branch coverage gaps
 
 `openshift/velero-plugin-for-csi` Tide only covers `oadp-1.0` through `oadp-1.3` + `oadp-dev` — it's missing `oadp-1.4`, `oadp-1.5`, `oadp-1.6`. However, this repo is `SKIP_REPO=true` in rebasebot, so it may be intentionally dormant. (CSI plugin was merged into Velero core starting in Velero 1.12 / OADP 1.4.)
 
@@ -419,6 +417,19 @@ core-services/prow/02_config/<org>/<repo>/
 ├── _pluginconfig.yaml    # Plugin settings (approve, lgtm, external_plugins)
 └── _prowconfig.yaml      # Tide queries, branch protection, merge methods
 ```
+
+### Audit Script
+
+The `audit.sh` script in this directory automates checking all OADP repos for configuration consistency. It fetches configs from `openshift/release` (or a local checkout with `--local`) and reports issues, warnings, and merge queue status.
+
+```
+./audit.sh [--branch master] [--format text|markdown] [--skip-queue] [--local <path>]
+```
+
+The script categorizes repos into three groups with different expected configurations:
+- **upstream-rebase**: Forks managed by rebasebot (expect `allow_force_pushes`, no `enforce_admins`)
+- **oadp-owned-openshift**: OADP-maintained repos in `openshift/` org (expect `enforce_admins`, review count)
+- **oadp-owned-migtools**: OADP-maintained repos in `migtools/` org (expect `enforce_admins`, review count)
 
 ### Relevant Documentation
 
