@@ -104,7 +104,7 @@
       <label><input type="checkbox" id="includeQueue" checked> Merge queue</label>
       <button id="runBtn" onclick="runAudit()">Run Audit</button>
     </div>
-    <div class="hint">Token stored in sessionStorage only. Required for merge queue checks (GitHub API, 60 req/hr without token).</div>
+    <div class="hint">Token stored in sessionStorage only. Required for merge queue checks (GitHub API, 60 req/hr without token). Token needs <code>public_repo</code> scope (classic) or <code>repo:status</code> + <code>read:org</code> (fine-grained).</div>
   </header>
   <div id="app"></div>
 
