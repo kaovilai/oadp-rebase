@@ -237,10 +237,33 @@ branch-protection:
 ```
 
 Key settings:
-- **`enforce_admins`**: Even org admins must follow branch protection rules
+- **`enforce_admins`**: Even org admins must follow branch protection rules. See [why this is needed](#why-enforce_admins-is-required) below.
 - **`required_approving_review_count`**: Number of GitHub approving reviews required (separate from Prow's approve/lgtm — this is a GitHub-native requirement)
 - **`dismiss_stale_reviews`**: Dismiss approving reviews when new commits are pushed
 - **`allow_force_pushes`**: Allow force-pushes to the branch (used by rebasebot for downstream rebases)
+
+### Why `enforce_admins` Is Required
+
+**`enforce_admins: true` is a workaround for a Prow/Tide limitation** ([kubernetes-sigs/prow#134](https://github.com/kubernetes-sigs/prow/issues/134)).
+
+Tide does not natively enforce GitHub's `required_approving_review_count` setting. Without `enforce_admins`, Tide can merge a PR that has the `approved` and `lgtm` Prow labels even if it hasn't received the required number of GitHub approving reviews. This is because Tide uses the GitHub API to merge, and by default the merge API bypasses branch protection for admin-level tokens (which Prow's bot account typically has).
+
+Setting `enforce_admins: true` closes this gap by forcing **all** merges — including those made by admin/bot accounts like Tide — to satisfy the `required_approving_review_count` before the merge API call succeeds.
+
+**Without `enforce_admins: true`:**
+```
+PR gets approved + lgtm labels → Tide merges immediately
+(GitHub review count requirement is silently bypassed)
+```
+
+**With `enforce_admins: true`:**
+```
+PR gets approved + lgtm labels → Tide attempts merge →
+GitHub API rejects if required_approving_review_count not met →
+PR stays open until enough GitHub reviews are submitted
+```
+
+This is why OADP-owned repos that set `required_approving_review_count` must also set `enforce_admins: true` — without it, the review count is effectively unenforced. Repos missing `enforce_admins` while having a review count requirement (see audit below) have a configuration gap where Tide can merge PRs without sufficient human reviews.
 
 ---
 
@@ -364,6 +387,8 @@ Has `lgtm` in its plugin list but no separate `lgtm:` configuration section. The
 - oadp-operator, oadp-must-gather, openshift-velero-plugin, most migtools repos
 
 This split is intentional — Pattern A repos need force pushes for rebasebot to update downstream branches from upstream, while Pattern B repos are directly maintained.
+
+**Important:** `enforce_admins: true` is required alongside `required_approving_review_count` as a workaround for [kubernetes-sigs/prow#134](https://github.com/kubernetes-sigs/prow/issues/134) — without it, Tide bypasses GitHub's review count requirement. See [Why `enforce_admins` Is Required](#why-enforce_admins-is-required).
 
 #### 5. Inconsistent `required_approving_review_count`
 

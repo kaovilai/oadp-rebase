@@ -36,6 +36,8 @@ RAW_BASE="https://raw.githubusercontent.com/openshift/release"
 #
 # oadp-owned: Repos maintained directly by the OADP team.
 #   These should have enforce_admins, required_approving_review_count: 2, etc.
+#   enforce_admins is required as a workaround for kubernetes-sigs/prow#134 —
+#   without it, Tide bypasses GitHub's required_approving_review_count.
 #
 UPSTREAM_REBASE_REPOS=(
   "openshift/velero"
@@ -414,7 +416,7 @@ audit_repo() {
     oadp-owned-openshift|oadp-owned-migtools)
       # These repos SHOULD have enforce_admins and review count
       if [[ "$enforce" != "true" ]]; then
-        warning "$repo: Missing enforce_admins=true (expected for OADP-owned repo)"
+        warning "$repo: Missing enforce_admins=true — Tide bypasses review count without it (prow#134)"
       fi
       if [[ "$review_count" == "NOT_SET" ]]; then
         warning "$repo: Missing required_approving_review_count (expected for OADP-owned repo)"
@@ -624,9 +626,9 @@ if [[ "$SKIP_QUEUE" != "true" ]]; then
     for repo in "${ALL_REPOS[@]}"; do
       if ! has_config "$repo"; then continue; fi
 
-      # Fetch open PRs with approved+lgtm
+      # Fetch open PRs with approved+lgtm (include reviews for ack check)
       pr_json="$(gh pr list --repo "$repo" --state open --label approved --label lgtm \
-        --json number,headRefName,baseRefName,author,title,labels,statusCheckRollup \
+        --json number,headRefName,baseRefName,author,title,labels,statusCheckRollup,reviews \
         2>/dev/null)" || continue
 
       pr_count="$(echo "$pr_json" | jq 'length')"
@@ -635,7 +637,14 @@ if [[ "$SKIP_QUEUE" != "true" ]]; then
       org="${repo%%/*}"
       reponame="${repo##*/}"
 
+      # Get required review count and enforce_admins for this repo from prow config
+      required_reviews="$(get_review_count "$repo")"
+      enforce="$(get_enforce_admins "$repo")"
+
       echo -e "  ${BOLD}$repo${RESET} ($pr_count PRs with approved+lgtm)"
+      if [[ "$required_reviews" != "NOT_SET" && "$required_reviews" != "MISSING_FILE" ]]; then
+        echo "  Required GitHub reviews: $required_reviews (enforce_admins: ${enforce})"
+      fi
 
       # Prow Tide query link for this repo
       prow_tide_url="${PROW_BASE}/tide?query=is%3Apr+state%3Aopen+repo%3A${org}%2F${reponame}"
@@ -669,6 +678,14 @@ if [[ "$SKIP_QUEUE" != "true" ]]; then
         pr_base="$(echo "$pr" | jq -r '.baseRefName')"
         pr_labels="$(echo "$pr" | jq -r '[.labels[].name] | join(",")')"
 
+        # Check GitHub approving reviews vs required count
+        # Only the latest review per author counts; filter for APPROVED state
+        approving_reviewers="$(echo "$pr" | jq -r '[.reviews[] | select(.state == "APPROVED") | .author.login] | unique | .[]')"
+        approval_count=0
+        if [[ -n "$approving_reviewers" ]]; then
+          approval_count="$(echo "$approving_reviewers" | wc -l | tr -d ' ')"
+        fi
+
         # Normalize checks
         checks="$(echo "$pr" | jq -c "$NORMALIZE_CHECKS_JQ")"
 
@@ -696,9 +713,19 @@ if [[ "$SKIP_QUEUE" != "true" ]]; then
         encoded_branch="$(echo "$pr_branch" | sed 's/ /%20/g; s/:/%3A/g; s|/|%2F|g')"
         prow_pr_url="${PROW_BASE}/pr?query=is%3Apr+repo%3A${org}%2F${reponame}+author%3A${pr_author}+head%3A${encoded_branch}"
 
+        # Check if insufficient reviews will block merge (prow#134 workaround)
+        missing_reviews=false
+        reviews_short=0
+        if [[ "$required_reviews" != "NOT_SET" && "$required_reviews" != "MISSING_FILE" && "$enforce" == "true" ]]; then
+          if (( approval_count < required_reviews )); then
+            missing_reviews=true
+            reviews_short=$((required_reviews - approval_count))
+          fi
+        fi
+
         # Determine overall status
         has_blockers=false
-        if [[ ${#label_blockers[@]} -gt 0 || -n "$failing" || -n "$errored" || -n "$pending" || -n "$in_progress" ]]; then
+        if [[ ${#label_blockers[@]} -gt 0 || -n "$failing" || -n "$errored" || -n "$pending" || -n "$in_progress" || "$missing_reviews" == "true" ]]; then
           has_blockers=true
         fi
 
@@ -715,6 +742,15 @@ if [[ "$SKIP_QUEUE" != "true" ]]; then
           for lbl in "${label_blockers[@]}"; do
             echo -e "      ${RED}BLOCKED${RESET}  label: $lbl"
           done
+        fi
+
+        # Insufficient GitHub reviews (enforce_admins blocks Tide merge)
+        if [[ "$missing_reviews" == "true" ]]; then
+          echo -e "      ${RED}REVIEWS${RESET}  ${approval_count}/${required_reviews} GitHub approvals (need $reviews_short more)"
+          echo -e "               ${YELLOW}Tide will attempt merge but GitHub will reject (enforce_admins + prow#134)${RESET}"
+          echo -e "               ${YELLOW}This PR may BLOCK other PRs behind it in the Tide queue for ${pr_base}${RESET}"
+        elif [[ "$required_reviews" != "NOT_SET" && "$required_reviews" != "MISSING_FILE" ]]; then
+          echo -e "      ${GREEN}REVIEWS${RESET}  ${approval_count}/${required_reviews} GitHub approvals"
         fi
 
         # Failed checks
