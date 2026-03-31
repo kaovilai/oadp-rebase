@@ -25,6 +25,7 @@ set -euo pipefail
 FORMAT="text"
 BRANCH="master"
 SKIP_QUEUE="false"
+LOCAL_RELEASE=""
 RAW_BASE="https://raw.githubusercontent.com/openshift/release"
 
 #
@@ -92,23 +93,28 @@ while [[ $# -gt 0 ]]; do
       SKIP_QUEUE="true"
       shift
       ;;
+    --local)
+      LOCAL_RELEASE="$2"
+      shift 2
+      ;;
     -h|--help)
-      echo "Usage: $0 [--branch master] [--format text|markdown] [--skip-queue]"
+      echo "Usage: $0 [--branch master] [--format text|markdown] [--skip-queue] [--local <path>]"
       echo ""
-      echo "Fetches Prow configs from openshift/release on GitHub and audits them."
+      echo "Audits Prow merge bot configs across OADP ecosystem repositories."
       echo ""
       echo "Options:"
       echo "  --branch BRANCH   Branch of openshift/release to fetch from (default: master)"
       echo "  --format FORMAT   Output format: text or markdown (default: text)"
       echo "  --skip-queue      Skip merge queue status check (requires gh CLI)"
+      echo "  --local PATH      Use a local openshift/release checkout instead of fetching via curl"
       echo ""
       echo "Environment:"
-      echo "  GITHUB_TOKEN      Optional token to avoid GitHub rate limits"
+      echo "  GITHUB_TOKEN      Optional token to avoid GitHub rate limits (ignored with --local)"
       exit 0
       ;;
     *)
       echo "Unknown option: $1" >&2
-      echo "Usage: $0 [--branch master] [--format text|markdown]" >&2
+      echo "Usage: $0 [--branch master] [--format text|markdown] [--skip-queue] [--local <path>]" >&2
       exit 1
       ;;
   esac
@@ -122,14 +128,24 @@ cleanup() { rm -rf "$CACHE_DIR"; }
 trap cleanup EXIT
 
 #
-# Fetch a file from GitHub raw content. Returns 0 if found, 1 if 404.
-# Downloaded file is cached locally in CACHE_DIR.
+# Validate --local path if provided
+#
+if [[ -n "$LOCAL_RELEASE" ]]; then
+  if [[ ! -d "$LOCAL_RELEASE/core-services/prow/02_config" ]]; then
+    echo "Error: --local path does not look like an openshift/release checkout" >&2
+    echo "Expected to find: $LOCAL_RELEASE/core-services/prow/02_config" >&2
+    exit 1
+  fi
+fi
+
+#
+# Fetch a file from GitHub raw content or copy from local checkout.
+# Returns 0 if found, 1 if not found. File is cached in CACHE_DIR.
 #
 fetch_file() {
   local org="$1" repo="$2" filename="$3"
   local local_dir="$CACHE_DIR/$org/$repo"
   local local_path="$local_dir/$filename"
-  local url="$RAW_BASE/$BRANCH/core-services/prow/02_config/$org/$repo/$filename"
 
   # Return cached copy if already fetched
   if [[ -f "$local_path" ]]; then
@@ -141,20 +157,34 @@ fetch_file() {
 
   mkdir -p "$local_dir"
 
-  local curl_args=(-sfL -o "$local_path" -w "%{http_code}")
-  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-    curl_args+=(-H "Authorization: token $GITHUB_TOKEN")
-  fi
-
-  local http_code
-  http_code="$(curl "${curl_args[@]}" "$url" 2>/dev/null)" || true
-
-  if [[ "$http_code" == "200" && -f "$local_path" ]]; then
-    return 0
+  if [[ -n "$LOCAL_RELEASE" ]]; then
+    # Copy from local checkout
+    local src="$LOCAL_RELEASE/core-services/prow/02_config/$org/$repo/$filename"
+    if [[ -f "$src" ]]; then
+      cp "$src" "$local_path"
+      return 0
+    else
+      touch "$local_path.404"
+      return 1
+    fi
   else
-    rm -f "$local_path"
-    touch "$local_path.404"
-    return 1
+    # Fetch from GitHub
+    local url="$RAW_BASE/$BRANCH/core-services/prow/02_config/$org/$repo/$filename"
+    local curl_args=(-sfL -o "$local_path" -w "%{http_code}")
+    if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+      curl_args+=(-H "Authorization: token $GITHUB_TOKEN")
+    fi
+
+    local http_code
+    http_code="$(curl "${curl_args[@]}" "$url" 2>/dev/null)" || true
+
+    if [[ "$http_code" == "200" && -f "$local_path" ]]; then
+      return 0
+    else
+      rm -f "$local_path"
+      touch "$local_path.404"
+      return 1
+    fi
   fi
 }
 
@@ -502,7 +532,11 @@ compare_field() {
 
 # --- Prefetch all configs ---
 echo -e "${BOLD}Prow Merge Bot Configuration Audit${RESET}"
-echo "Source: github.com/openshift/release @ $BRANCH"
+if [[ -n "$LOCAL_RELEASE" ]]; then
+  echo "Source: $LOCAL_RELEASE (local checkout)"
+else
+  echo "Source: github.com/openshift/release @ $BRANCH"
+fi
 echo "Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo ""
 echo -n "Fetching configs..."
@@ -670,6 +704,30 @@ if [[ "$SKIP_QUEUE" != "true" ]]; then
         }
       ]'
 
+      # Pre-scan: identify PRs that will block the Tide queue due to insufficient
+      # reviews. Tide picks the first eligible PR per branch; if that PR has
+      # approved+lgtm but not enough GitHub reviews, enforce_admins causes the
+      # merge API call to fail, blocking all PRs behind it on the same branch.
+      # We build a lookup: base_branch -> "blocker PR numbers and review needs"
+      # stored in a temp file as "base_branch|pr_num|reviews_short" lines.
+      review_blockers_file="$(mktemp)"
+
+      if [[ "$required_reviews" != "NOT_SET" && "$required_reviews" != "MISSING_FILE" && "$enforce" == "true" ]]; then
+        echo "$pr_json" | jq -c '.[]' | while IFS= read -r _pr; do
+          _base="$(echo "$_pr" | jq -r '.baseRefName')"
+          _num="$(echo "$_pr" | jq -r '.number')"
+          _approvals="$(echo "$_pr" | jq -r '[.reviews[] | select(.state == "APPROVED") | .author.login] | unique | length')"
+          # Check tide state
+          _tide="$(echo "$_pr" | jq -r "$NORMALIZE_CHECKS_JQ" | jq -r '[.[] | select(.check_name == "tide") | .check_state] | first // "NOT_REPORTED"')"
+          # Only flag as a queue blocker if Tide considers it eligible (SUCCESS)
+          # but it will fail due to insufficient reviews
+          if (( _approvals < required_reviews )) && [[ "$_tide" == "SUCCESS" ]]; then
+            _short=$((required_reviews - _approvals))
+            echo "${_base}|${_num}|${_short}" >> "$review_blockers_file"
+          fi
+        done
+      fi
+
       echo "$pr_json" | jq -c '.[]' | while IFS= read -r pr; do
         pr_num="$(echo "$pr" | jq -r '.number')"
         pr_author="$(echo "$pr" | jq -r '.author.login')"
@@ -796,16 +854,45 @@ if [[ "$SKIP_QUEUE" != "true" ]]; then
         if [[ "$tide_state" == "SUCCESS" ]]; then
           echo -e "      ${GREEN}TIDE${RESET}     merge criteria met — merging soon"
         elif [[ "$tide_state" == "PENDING" ]]; then
-          echo -e "      ${CYAN}TIDE${RESET}     waiting (another PR may be testing ahead in queue)"
+          # Check if any review-blocked PRs are ahead on the same branch
+          branch_blockers=""
+          if [[ -s "$review_blockers_file" ]]; then
+            while IFS='|' read -r b_base b_num b_short; do
+              if [[ "$b_base" == "$pr_base" && "$b_num" != "$pr_num" ]]; then
+                branch_blockers="${branch_blockers:+$branch_blockers, }#${b_num} (needs ${b_short} more review(s) — https://github.com/${repo}/pull/${b_num})"
+              fi
+            done < "$review_blockers_file"
+          fi
+
+          if [[ -n "$branch_blockers" ]]; then
+            echo -e "      ${CYAN}TIDE${RESET}     waiting — review-blocked PRs ahead in queue: ${YELLOW}${branch_blockers}${RESET}"
+          else
+            echo -e "      ${CYAN}TIDE${RESET}     waiting (another PR may be testing ahead in queue)"
+          fi
         fi
 
-        # All green
+        # All green — but may still be stuck behind a review-blocked PR
         if ! $has_blockers; then
-          echo -e "      ${GREEN}READY${RESET}    All checks passed, no blocking labels — merge imminent"
+          ready_blockers=""
+          if [[ -s "$review_blockers_file" ]]; then
+            while IFS='|' read -r b_base b_num b_short; do
+              if [[ "$b_base" == "$pr_base" && "$b_num" != "$pr_num" ]]; then
+                ready_blockers="${ready_blockers:+$ready_blockers, }#${b_num} (needs ${b_short} more review(s) — https://github.com/${repo}/pull/${b_num})"
+              fi
+            done < "$review_blockers_file"
+          fi
+
+          if [[ -n "$ready_blockers" ]]; then
+            echo -e "      ${GREEN}READY${RESET}    All checks passed, no blocking labels — but review-blocked PRs may delay merge: ${YELLOW}${ready_blockers}${RESET}"
+          else
+            echo -e "      ${GREEN}READY${RESET}    All checks passed, no blocking labels — merge imminent"
+          fi
         fi
 
         echo ""
       done
+
+      rm -f "$review_blockers_file"
 
       ((QUEUE_TOTAL += pr_count))
     done
