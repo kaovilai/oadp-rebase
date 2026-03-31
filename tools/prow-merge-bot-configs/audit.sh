@@ -735,6 +735,7 @@ if [[ "$SKIP_QUEUE" != "true" ]]; then
           echo -e "    ${GREEN}#${pr_num}${RESET} [${pr_base}] ${pr_title}"
         fi
         echo "      Author: ${pr_author}"
+        echo "      PR:     https://github.com/${repo}/pull/${pr_num}"
         echo "      Prow:   $prow_pr_url"
 
         # Blocking labels
