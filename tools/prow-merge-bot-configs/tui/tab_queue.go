@@ -264,6 +264,14 @@ func (m *queueModel) buildRows() {
 			continue
 		}
 
+		// Collect tideErrLoopBlocker PRs for this repo (blocks entire Tide queue, not just same branch).
+		var tideErrLoopBlockerPRs []int
+		for _, pr := range report.PRs {
+			if pr.ReviewBlocked && report.EnforceAdmins && len(pr.LabelBlockers) == 0 {
+				tideErrLoopBlockerPRs = append(tideErrLoopBlockerPRs, pr.Number)
+			}
+		}
+
 		// Sort PRs: tideErrLoopBlocker blockers first, then other blocked, then ready.
 		sortedPRs := make([]PRStatus, len(report.PRs))
 		copy(sortedPRs, report.PRs)
@@ -291,11 +299,25 @@ func (m *queueModel) buildRows() {
 			// Only possible when enforce_admins=true — without it, Tide merges on labels alone.
 			isTideErrLoopBlocker := pr.ReviewBlocked && report.EnforceAdmins && len(pr.LabelBlockers) == 0
 
+			// Check if other PRs in the repo are tideErrLoopBlockers (affects this PR even if ready).
+			hasRepoTideErrBlockers := false
+			if !pr.HasBlockers {
+				for _, blockerNum := range tideErrLoopBlockerPRs {
+					if blockerNum != pr.Number {
+						hasRepoTideErrBlockers = true
+						break
+					}
+				}
+			}
+
 			icon := "✗"
 			prSev := SeverityWarning // regular blocked PR
 			if isTideErrLoopBlocker {
 				icon = "⚠"
 				prSev = SeverityIssue // most severe — blocks entire queue
+			} else if !pr.HasBlockers && hasRepoTideErrBlockers {
+				icon = "⚠"
+				prSev = SeverityWarning // ready but Tide queue may be stuck
 			} else if !pr.HasBlockers {
 				icon = "✓"
 				prSev = SeverityOK
@@ -316,7 +338,9 @@ func (m *queueModel) buildRows() {
 			if len(pr.LabelBlockers) > 0 {
 				summaryParts = append(summaryParts, fmt.Sprintf("%d label blockers", len(pr.LabelBlockers)))
 			}
-			if !pr.HasBlockers {
+			if !pr.HasBlockers && hasRepoTideErrBlockers {
+				summaryParts = append(summaryParts, "ready · ⚠ tideErrLoopBlocker in repo")
+			} else if !pr.HasBlockers {
 				summaryParts = append(summaryParts, "ready")
 			}
 
@@ -466,6 +490,21 @@ func (m *queueModel) buildRows() {
 
 			// Ready status.
 			if !pr.HasBlockers {
+				// Check if any OTHER PR in this repo is a tideErrLoopBlocker (blocks entire Tide queue).
+				var repoTideBlockers []string
+				for _, blockerNum := range tideErrLoopBlockerPRs {
+					if blockerNum != pr.Number {
+						repoTideBlockers = append(repoTideBlockers, fmt.Sprintf("#%d", blockerNum))
+					}
+				}
+				if len(repoTideBlockers) > 0 {
+					m.rows = append(m.rows, queueRow{
+						kind: rowRepoDetail, repoName: repo, prKey: prKey,
+						text:     fmt.Sprintf("      ⚠ WARN   Tide may be blocked — tideErrLoopBlocker PRs in repo: %s (enforce_admins + prow#134)", strings.Join(repoTideBlockers, ", ")),
+						severity: SeverityIssue,
+					})
+				}
+
 				if len(pr.BranchBlockers) > 0 {
 					m.rows = append(m.rows, queueRow{
 						kind: rowRepoDetail, repoName: repo, prKey: prKey,

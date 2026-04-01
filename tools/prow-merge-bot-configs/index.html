@@ -804,6 +804,16 @@ function renderQueueEntry(entry) {
     }
 
     if (!pr.hasBlockers) {
+      // Check for tideErrLoopBlocker PRs anywhere in the repo (blocks entire Tide queue).
+      const allTideErrBlockers = Object.values(reviewBlockersByBranch)
+        .flat()
+        .filter(b => b.number !== pr.number);
+      if (allTideErrBlockers.length) {
+        const blockerLinks = allTideErrBlockers.map(b =>
+          `<a href="${safeHref(b.url)}" target="_blank" rel="noopener noreferrer">#${b.number}</a>`);
+        qc += `<div class="chk" style="color:var(--red)">${badge('issue','⚠')} Tide may be blocked — tideErrLoopBlocker PRs in repo: ${blockerLinks.join(', ')} (enforce_admins + prow#134)</div>`;
+      }
+
       const branchBlockers = (reviewBlockersByBranch[pr.base] || [])
         .filter(b => b.number !== pr.number)
         .map(b => `<a href="${safeHref(b.url)}" target="_blank" rel="noopener noreferrer">#${b.number}</a> (needs ${b.reviewsShort} more review(s))`);
@@ -838,7 +848,9 @@ function renderQueue() {
     }
   }
 
-  const title = `Merge Queue Status <button class="btn-check-all" id="check-all-btn">Check all</button>`;
+  const hasToken = !!document.getElementById('token')?.value.trim();
+  const checkAllDisabled = hasToken ? '' : ' disabled title="Provide a GitHub token to enable (60 req/hr limit without token)"';
+  const title = `Merge Queue Status <button class="btn-check-all" id="check-all-btn"${checkAllDisabled}>Check all</button>`;
   el.innerHTML = sec(title,
     'PRs with all required Tide labels that haven\'t merged yet. Click per-repo or "Check all" (uses GitHub API). Without a token the limit is 60 req/hr — only check repos you need.',
     qc);
