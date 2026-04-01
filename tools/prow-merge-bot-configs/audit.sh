@@ -68,12 +68,12 @@ OADP_OWNED_MIGTOOLS_REPOS=(
   "migtools/udistribution"
   "migtools/velero-plugin-for-vsm"
   "migtools/volume-snapshot-mover"
+  "migtools/oadp-vmdp"
+  "migtools/kopia"
 )
 
 # Repos expected to have no prow config (no CI in OpenShift CI)
 NO_PROW_CONFIG_REPOS=(
-  "migtools/oadp-vmdp"
-  "migtools/kopia"
 )
 
 #
@@ -251,12 +251,13 @@ fetch_configs() {
 }
 
 #
-# Check if a repo has config (both files fetched successfully)
+# Check if a repo has config (at least one of the files exists)
 #
 has_config() {
-  local f
-  f="$(pluginconfig_for "$1")"
-  [[ -f "$f" ]]
+  local plugin prow
+  plugin="$(pluginconfig_for "$1")"
+  prow="$(prowconfig_for "$1")"
+  [[ -f "$plugin" || -f "$prow" ]]
 }
 
 #
@@ -545,7 +546,7 @@ ALL_REPOS_TO_FETCH=(
   "${UPSTREAM_REBASE_REPOS[@]}"
   "${OADP_OWNED_OPENSHIFT_REPOS[@]}"
   "${OADP_OWNED_MIGTOOLS_REPOS[@]}"
-  "${NO_PROW_CONFIG_REPOS[@]}"
+  ${NO_PROW_CONFIG_REPOS[@]+"${NO_PROW_CONFIG_REPOS[@]}"}
 )
 
 FETCH_ERRORS=0
@@ -556,7 +557,7 @@ echo " done (${#ALL_REPOS_TO_FETCH[@]} repos, $FETCH_ERRORS without configs)"
 
 # --- Check repos with no expected config ---
 section "Repos With No Prow Config (Expected)"
-for repo in "${NO_PROW_CONFIG_REPOS[@]}"; do
+for repo in ${NO_PROW_CONFIG_REPOS[@]+"${NO_PROW_CONFIG_REPOS[@]}"}; do
   if has_config "$repo"; then
     warning "$repo: Has prow config but was expected to have none"
   else
@@ -716,7 +717,10 @@ if [[ "$SKIP_QUEUE" != "true" ]]; then
         echo "$pr_json" | jq -c '.[]' | while IFS= read -r _pr; do
           _base="$(echo "$_pr" | jq -r '.baseRefName')"
           _num="$(echo "$_pr" | jq -r '.number')"
-          _approvals="$(echo "$_pr" | jq -r '[.reviews[] | select(.state == "APPROVED") | .author.login] | unique | length')"
+          _approvals="$(echo "$_pr" | jq -r '
+            [.reviews[] | {login: .author.login, state: .state, at: .submittedAt}]
+            | group_by(.login) | map(sort_by(.at) | last)
+            | map(select(.state == "APPROVED")) | length')"
           # Check tide state
           _tide="$(echo "$_pr" | jq -r "$NORMALIZE_CHECKS_JQ" | jq -r '[.[] | select(.check_name == "tide") | .check_state] | first // "NOT_REPORTED"')"
           # Only flag as a queue blocker if Tide considers it eligible (SUCCESS)
@@ -737,8 +741,13 @@ if [[ "$SKIP_QUEUE" != "true" ]]; then
         pr_labels="$(echo "$pr" | jq -r '[.labels[].name] | join(",")')"
 
         # Check GitHub approving reviews vs required count
-        # Only the latest review per author counts; filter for APPROVED state
-        approving_reviewers="$(echo "$pr" | jq -r '[.reviews[] | select(.state == "APPROVED") | .author.login] | unique | .[]')"
+        # Collapse to latest review per author (by submittedAt), then count APPROVED
+        approving_reviewers="$(echo "$pr" | jq -r '
+          [.reviews[] | {login: .author.login, state: .state, at: .submittedAt}]
+          | group_by(.login)
+          | map(sort_by(.at) | last)
+          | map(select(.state == "APPROVED") | .login)
+          | .[]')"
         approval_count=0
         if [[ -n "$approving_reviewers" ]]; then
           approval_count="$(echo "$approving_reviewers" | wc -l | tr -d ' ')"
@@ -752,7 +761,6 @@ if [[ "$SKIP_QUEUE" != "true" ]]; then
         errored="$(echo "$checks" | jq -r '[.[] | select(.check_state == "ERROR" and .check_name != "tide") | .check_name] | sort | .[]')"
         pending="$(echo "$checks" | jq -r '[.[] | select(.check_state == "PENDING" and .check_name != "tide") | .check_name] | sort | .[]')"
         in_progress="$(echo "$checks" | jq -r '[.[] | select(.check_state == "IN_PROGRESS" and .check_name != "tide") | .check_name] | sort | .[]')"
-        succeeded="$(echo "$checks" | jq -r '[.[] | select(.check_state == "SUCCESS" and .check_name != "tide") | .check_name] | sort | .[]')"
 
         # Tide status
         tide_state="$(echo "$checks" | jq -r '[.[] | select(.check_name == "tide") | .check_state] | first // "NOT_REPORTED"')"

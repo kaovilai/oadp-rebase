@@ -321,6 +321,8 @@ For a PR to merge in an OADP repo, it typically needs:
 | **migtools/udistribution** | `false` | not set (=false) | **no** | yes |
 | **migtools/velero-plugin-for-vsm** | `false` | not set (=false) | yes | yes |
 | **migtools/volume-snapshot-mover** | `false` | not set (=false) | yes | yes |
+| **migtools/oadp-vmdp** | `false` | not set (=false) | yes | yes |
+| **migtools/kopia** | `false` | not set (=false) | yes | yes |
 
 ### Branch Protection Comparison
 
@@ -347,6 +349,8 @@ For a PR to merge in an OADP repo, it typically needs:
 | **migtools/udistribution** | `true` | `2` | not set | `true` |
 | **migtools/velero-plugin-for-vsm** | not set | `2` | `true` (per-branch) | `true` |
 | **migtools/volume-snapshot-mover** | not set | `2` | `true` (per-branch) | `true` |
+| **migtools/oadp-vmdp** | not set | not set | not set | not set |
+| **migtools/kopia** | not set | not set | not set | not set |
 
 ### Merge Method Comparison
 
@@ -394,15 +398,7 @@ Most repos with branch protection require **2** approving reviews, but:
 - `migtools/filebrowser`: requires only **1**
 - `migtools/oadp-vm-file-restore`: requires only **1**
 
-#### 5. Missing Prow config directories
-
-These repos are in the rebasebot ecosystem but have **no Prow config directory** in `openshift/release`:
-- `migtools/oadp-vmdp`
-- `migtools/kopia`
-
-They may not have CI jobs in OpenShift CI at all.
-
-#### 6. Tide branch coverage gaps
+#### 5. Tide branch coverage gaps
 
 `openshift/velero-plugin-for-csi` Tide only covers `oadp-1.0` through `oadp-1.3` + `oadp-dev` — it's missing `oadp-1.4`, `oadp-1.5`, `oadp-1.6`. However, this repo is `SKIP_REPO=true` in rebasebot, so it may be intentionally dormant. (CSI plugin was merged into Velero core starting in Velero 1.12 / OADP 1.4.)
 
@@ -423,7 +419,7 @@ core-services/prow/02_config/<org>/<repo>/
 The `audit.sh` script in this directory automates checking all OADP repos for configuration consistency. It fetches configs from `openshift/release` (or a local checkout with `--local`) and reports issues, warnings, and merge queue status.
 
 ```
-./audit.sh [--branch master] [--format text|markdown] [--skip-queue] [--local <path>]
+./audit.sh [--branch main] [--format text|markdown] [--skip-queue] [--local <path>]
 ```
 
 The script categorizes repos into three groups with different expected configurations:

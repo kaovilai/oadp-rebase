@@ -29,6 +29,14 @@ jobs:
         run: |
           mkdir -p _site
           cp tools/prow-merge-bot-configs/index.html _site/
+          cat > _site/badge.json <<'EOF'
+          {
+            "schemaVersion": 1,
+            "label": "prow audit",
+            "message": "pending",
+            "color": "lightgrey"
+          }
+          EOF
 
       - uses: actions/configure-pages@v6
 

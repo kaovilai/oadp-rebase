@@ -104,11 +104,13 @@
       <label><input type="checkbox" id="includeQueue" checked> Merge queue</label>
       <button id="runBtn" onclick="runAudit()">Run Audit</button>
     </div>
-    <div class="hint">Token stored in sessionStorage only. Required for merge queue checks (GitHub API, 60 req/hr without token). Token needs <code>public_repo</code> scope (classic) or <code>repo:status</code> + <code>read:org</code> (<a href="https://github.com/settings/personal-access-tokens/new" target="_blank">fine-grained</a>).</div>
+    <div class="hint">Token stored in sessionStorage only. Required for merge queue checks (GitHub API, 60 req/hr without token). Token needs <code>public_repo</code> scope (classic) or <code>repo:status</code> + <code>read:org</code> (<a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer">fine-grained</a>).</div>
   </header>
   <div id="app"></div>
 
-  <script src="https://cdn.jsdelivr.net/npm/js-yaml@4.1.0/dist/js-yaml.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/js-yaml@4.1.0/dist/js-yaml.min.js"
+          integrity="sha384-+pxiN6T7yvpryuJmE1gM9PX7yQit15auDb+ZwwvJOd/4be2Cie5/IuVXgQb/S9du"
+          crossorigin="anonymous"></script>
   <script>
 'use strict';
 
@@ -143,12 +145,8 @@ const GROUPS = {
       'migtools/kubevirt-velero-plugin','migtools/oadp-cli','migtools/oadp-non-admin',
       'migtools/oadp-vm-file-restore','migtools/udistribution',
       'migtools/velero-plugin-for-vsm','migtools/volume-snapshot-mover',
+      'migtools/oadp-vmdp','migtools/kopia',
     ]
-  },
-  'no-prow': {
-    label: 'Repos With No Prow Config (Expected)',
-    desc: 'These repos are not in OpenShift CI and should have no prow config.',
-    repos: ['migtools/oadp-vmdp','migtools/kopia']
   }
 };
 
@@ -172,7 +170,10 @@ const hdrs = () => {
   return h;
 };
 const log = m => { const el = document.getElementById('progress'); if (el) el.textContent = m; };
-const badge = (cls, txt) => `<span class="badge b-${cls}">${txt || cls}</span>`;
+const esc = s => String(s).replace(/[&<>"']/g, c =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const safeHref = u => { try { const p = new URL(String(u)); return ['https:','http:'].includes(p.protocol) ? esc(u) : '#'; } catch { return '#'; } };
+const badge = (cls, txt) => `<span class="badge b-${cls}">${esc(txt || cls)}</span>`;
 
 // ── YAML Fetch ─────────────────────────────────────────────────
 async function fetchYaml(url) {
@@ -361,9 +362,17 @@ async function checkMergeQueue(repos) {
         const chkData = chkResp.ok ? await chkResp.json() : { check_runs: [] };
         const stData = stResp.ok ? await stResp.json() : { statuses: [] };
 
-        // Unique approvers
-        const approvers = new Set();
-        for (const rv of reviews) { if (rv.state === 'APPROVED') approvers.add(rv.user.login); }
+        // Unique approvers — only count latest review per author
+        const latestByUser = new Map();
+        for (const rv of reviews) {
+          if (!rv.user?.login || !rv.submitted_at) continue;
+          const prev = latestByUser.get(rv.user.login);
+          if (!prev || new Date(rv.submitted_at) > new Date(prev.submitted_at))
+            latestByUser.set(rv.user.login, rv);
+        }
+        const approvers = new Set(
+          [...latestByUser.values()].filter(rv => rv.state === 'APPROVED').map(rv => rv.user.login)
+        );
 
         // Normalize checks
         const checks = [];
@@ -383,6 +392,7 @@ async function checkMergeQueue(repos) {
         const pending = checks.filter(c => c.state === 'PENDING' && c.name !== 'tide');
         const running = checks.filter(c => c.state === 'IN_PROGRESS' && c.name !== 'tide');
         const tide = checks.find(c => c.name === 'tide');
+        const tideBlocked = tide && !['SUCCESS', 'PENDING'].includes(tide.state);
         const prLabels = pr.labels.map(l => l.name);
         const blockerLabels = BLOCKER_LABELS.filter(b => prLabels.includes(b));
 
@@ -394,7 +404,7 @@ async function checkMergeQueue(repos) {
         }
 
         const hasBlockers = blockerLabels.length > 0 || failing.length > 0 || errored.length > 0
-          || pending.length > 0 || running.length > 0 || missingReviews;
+          || pending.length > 0 || running.length > 0 || missingReviews || tideBlocked;
 
         const encBranch = encodeURIComponent(pr.head.ref);
         details.push({
@@ -404,7 +414,7 @@ async function checkMergeQueue(repos) {
           requiredReviews: isNaN(reqNum) ? null : reqNum, enforce,
           missingReviews, reviewsShort,
           failing, errored, pending, running,
-          tide: tide?.state || 'NOT_REPORTED', hasBlockers,
+          tide: tide?.state || 'NOT_REPORTED', tideBlocked: !!tideBlocked, hasBlockers,
           prowUrl: `${PROW}/pr?query=is%3Apr+repo%3A${org}%2F${repo}+author%3A${pr.user.login}+head%3A${encBranch}`,
         });
       }
@@ -437,7 +447,7 @@ function render() {
     <div class="summary-item"><div class="num" style="color:var(--red)">${counts.issues}</div><div class="lbl">Issues</div></div>
     <div class="summary-item"><div class="num" style="color:var(--yellow)">${counts.warnings}</div><div class="lbl">Warnings</div></div>
     <div class="summary-item"><div class="num" style="color:var(--blue)">${counts.info}</div><div class="lbl">Info</div></div>
-    <div class="summary-meta">Source: openshift/release @ ${branch}<br>${new Date().toISOString()}</div>
+    <div class="summary-meta">Source: openshift/release @ ${esc(branch)}<br>${new Date().toISOString()}</div>
   </div>`;
 
   // Per-group sections
@@ -445,16 +455,12 @@ function render() {
     let c = '';
     for (const repo of group.repos) {
       const entries = results.filter(r => r.repo === repo);
-      if (!entries.length) {
-        if (type === 'no-prow' && !hasConfig(repo))
-          c += `<div class="entry">${badge('ok','OK')} <span class="repo">${repo}</span> No prow config (expected)</div>`;
-        continue;
-      }
+      if (!entries.length) continue;
       for (const e of entries)
-        c += `<div class="entry">${badge(e.level, e.level)} <span class="repo">${repo}</span>: ${e.msg}</div>`;
+        c += `<div class="entry">${badge(e.level, e.level)} <span class="repo">${esc(repo)}</span>: ${esc(e.msg)}</div>`;
     }
     if (!c) c = '<div class="entry none">No findings</div>';
-    h += sec(group.label, group.desc, c, type === 'no-prow');
+    h += sec(group.label, group.desc, c);
   }
 
   // Cross-repo comparison
@@ -462,7 +468,7 @@ function render() {
     'review_count','dismiss_stale_reviews','allow_force_pushes','merge_method'];
 
   for (const [type, group] of Object.entries(GROUPS)) {
-    if (type === 'no-prow') continue;
+    if (!group.repos.length) continue;
     const fields = type === 'upstream-rebase'
       ? ['require_self_approval','review_acts_as_lgtm','allow_force_pushes','merge_method']
       : compFields;
@@ -470,9 +476,9 @@ function render() {
     for (const f of fields) {
       const r = compareField(f, group.repos);
       if (!r) continue;
-      c += `<div class="entry"><span class="field">${r.fieldName}</span> (majority: <code>${r.majority}</code>)`;
+      c += `<div class="entry"><span class="field">${esc(r.fieldName)}</span> (majority: <code>${esc(r.majority)}</code>)`;
       for (const [repo, val] of r.outliers)
-        c += `<br>&nbsp;&nbsp;${badge('warn','differs')} <span class="repo">${repo}</span>: <code>${val}</code>`;
+        c += `<br>&nbsp;&nbsp;${badge('warn','differs')} <span class="repo">${esc(repo)}</span>: <code>${esc(val)}</code>`;
       c += '</div>';
     }
     if (!c) c = '<div class="entry" style="color:var(--green)">All repos consistent</div>';
@@ -482,13 +488,13 @@ function render() {
   // Tide branch coverage
   let bc = '';
   for (const [type, group] of Object.entries(GROUPS)) {
-    if (type === 'no-prow') continue;
+    if (!group.repos.length) continue;
     for (const repo of group.repos) {
       if (!hasConfig(repo)) continue;
       const branches = tideBranches(repo);
-      bc += `<div class="entry"><span class="repo">${repo}</span>: `;
+      bc += `<div class="entry"><span class="repo">${esc(repo)}</span>: `;
       bc += branches.length
-        ? branches.map(b => `<code>${b}</code>`).join(', ')
+        ? branches.map(b => `<code>${esc(b)}</code>`).join(', ')
         : `${badge('warn','warn')} No includedBranches (uses excludedBranches or all-branch query)`;
       bc += '</div>';
     }
@@ -500,14 +506,14 @@ function render() {
     let qc = '', total = 0;
     for (const entry of queue) {
       if (entry.error) {
-        qc += `<div class="entry">${badge('warn','error')} <span class="repo">${entry.repo}</span>: ${entry.error}</div>`;
+        qc += `<div class="entry">${badge('warn','error')} <span class="repo">${esc(entry.repo)}</span>: ${esc(entry.error)}</div>`;
         continue;
       }
       total += entry.count;
-      qc += `<div class="entry"><span class="repo">${entry.repo}</span> (${entry.count} PRs with approved+lgtm)`;
+      qc += `<div class="entry"><span class="repo">${esc(entry.repo)}</span> (${entry.count} PRs with approved+lgtm)`;
       if (entry.reqReviews !== 'NOT_SET' && entry.reqReviews !== 'MISSING_FILE')
-        qc += ` — Required reviews: ${entry.reqReviews} (enforce_admins: ${entry.enforce})`;
-      qc += ` <a href="${entry.tideUrl}" target="_blank">Tide</a>`;
+        qc += ` — Required reviews: ${esc(entry.reqReviews)} (enforce_admins: ${esc(entry.enforce)})`;
+      qc += ` <a href="${safeHref(entry.tideUrl)}" target="_blank" rel="noopener noreferrer">Tide</a>`;
 
       // Pre-compute review blockers per branch for this repo
       const reviewBlockersByBranch = {};
@@ -524,13 +530,13 @@ function render() {
         const color = pr.hasBlockers ? 'var(--red)' : 'var(--green)';
         qc += `<div class="pr-card">
           <div class="pr-title" style="color:${color}">
-            <a href="${pr.url}" target="_blank">#${pr.number}</a> [${pr.base}] ${pr.title}
+            <a href="${safeHref(pr.url)}" target="_blank" rel="noopener noreferrer">#${pr.number}</a> [${esc(pr.base)}] ${esc(pr.title)}
           </div>
-          <div class="pr-meta">Author: ${pr.author} · <a href="${pr.prowUrl}" target="_blank">Prow</a></div>
+          <div class="pr-meta">Author: ${esc(pr.author)} · <a href="${safeHref(pr.prowUrl)}" target="_blank" rel="noopener noreferrer">Prow</a></div>
           <div class="pr-checks">`;
 
         for (const lbl of pr.blockerLabels)
-          qc += `<div class="chk">${badge('issue','BLOCKED')} ${lbl}</div>`;
+          qc += `<div class="chk">${badge('issue','BLOCKED')} ${esc(lbl)}</div>`;
 
         if (pr.missingReviews) {
           qc += `<div class="chk">${badge('issue','REVIEWS')} ${pr.approvalCount}/${pr.requiredReviews} approvals (need ${pr.reviewsShort} more)</div>`;
@@ -539,24 +545,26 @@ function render() {
           qc += `<div class="chk">${badge('ok','REVIEWS')} ${pr.approvalCount}/${pr.requiredReviews} approvals</div>`;
         }
 
-        for (const c of pr.failing) qc += `<div class="chk">${badge('issue','FAILED')} ${c.name}</div>`;
-        for (const c of pr.errored) qc += `<div class="chk">${badge('issue','ERROR')} ${c.name}</div>`;
-        for (const c of pr.running) qc += `<div class="chk">${badge('warn','RUNNING')} ${c.name}</div>`;
+        for (const c of pr.failing) qc += `<div class="chk">${badge('issue','FAILED')} ${esc(c.name)}</div>`;
+        for (const c of pr.errored) qc += `<div class="chk">${badge('issue','ERROR')} ${esc(c.name)}</div>`;
+        for (const c of pr.running) qc += `<div class="chk">${badge('warn','RUNNING')} ${esc(c.name)}</div>`;
 
         if (pr.pending.length <= 5) {
-          for (const c of pr.pending) qc += `<div class="chk">${badge('warn','PENDING')} ${c.name}</div>`;
+          for (const c of pr.pending) qc += `<div class="chk">${badge('warn','PENDING')} ${esc(c.name)}</div>`;
         } else {
-          for (const c of pr.pending.slice(0, 3)) qc += `<div class="chk">${badge('warn','PENDING')} ${c.name}</div>`;
+          for (const c of pr.pending.slice(0, 3)) qc += `<div class="chk">${badge('warn','PENDING')} ${esc(c.name)}</div>`;
           qc += `<div class="chk">${badge('warn','PENDING')} ... and ${pr.pending.length - 3} more</div>`;
         }
 
-        if (pr.tide === 'SUCCESS')
+        if (pr.tideBlocked)
+          qc += `<div class="chk">${badge('issue','TIDE')} ${esc(pr.tide)}</div>`;
+        else if (pr.tide === 'SUCCESS')
           qc += `<div class="chk">${badge('ok','TIDE')} merge criteria met — merging soon</div>`;
         else if (pr.tide === 'PENDING') {
           // Check if review-blocked PRs ahead on same branch
           const branchBlockers = (reviewBlockersByBranch[pr.base] || [])
             .filter(b => b.number !== pr.number)
-            .map(b => `<a href="${b.url}" target="_blank">#${b.number}</a> (needs ${b.reviewsShort} more review(s))`);
+            .map(b => `<a href="${safeHref(b.url)}" target="_blank" rel="noopener noreferrer">#${b.number}</a> (needs ${b.reviewsShort} more review(s))`);
           if (branchBlockers.length)
             qc += `<div class="chk">${badge('info','TIDE')} waiting — review-blocked PRs ahead: ${branchBlockers.join(', ')}</div>`;
           else
@@ -566,7 +574,7 @@ function render() {
         if (!pr.hasBlockers) {
           const branchBlockers = (reviewBlockersByBranch[pr.base] || [])
             .filter(b => b.number !== pr.number)
-            .map(b => `<a href="${b.url}" target="_blank">#${b.number}</a> (needs ${b.reviewsShort} more review(s))`);
+            .map(b => `<a href="${safeHref(b.url)}" target="_blank" rel="noopener noreferrer">#${b.number}</a> (needs ${b.reviewsShort} more review(s))`);
           if (branchBlockers.length)
             qc += `<div class="chk">${badge('ok','READY')} All checks passed — but review-blocked PRs may delay merge: ${branchBlockers.join(', ')}</div>`;
           else
@@ -597,21 +605,16 @@ async function runAudit() {
   try {
     await fetchAllConfigs(branch);
 
-    // No-prow repos
-    for (const repo of GROUPS['no-prow'].repos) {
-      if (hasConfig(repo)) add(repo, 'warn', 'Has prow config but was expected to have none');
-    }
-
     // Audit each group
     log('Running audit...');
     for (const [type, group] of Object.entries(GROUPS)) {
-      if (type === 'no-prow') continue;
+      if (!group.repos.length) continue;
       for (const repo of group.repos) auditRepo(repo, type);
     }
 
     // Merge queue
     if (includeQueue) {
-      const all = Object.entries(GROUPS).filter(([t]) => t !== 'no-prow').flatMap(([,g]) => g.repos);
+      const all = Object.values(GROUPS).flatMap(g => g.repos);
       queue = await checkMergeQueue(all);
     }
 
@@ -621,7 +624,7 @@ async function runAudit() {
     const t = document.getElementById('token').value.trim();
     if (t) sessionStorage.setItem('prow-audit-token', t);
   } catch (e) {
-    document.getElementById('app').innerHTML = `<div style="color:var(--red)">Error: ${e.message}</div>`;
+    document.getElementById('app').innerHTML = `<div style="color:var(--red)">Error: ${esc(e.message)}</div>`;
   } finally {
     btn.disabled = false; btn.textContent = 'Run Audit';
   }
