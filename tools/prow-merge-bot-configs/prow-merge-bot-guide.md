@@ -414,15 +414,47 @@ core-services/prow/02_config/<org>/<repo>/
 └── _prowconfig.yaml      # Tide queries, branch protection, merge methods
 ```
 
-### Audit Script
+### Audit Tools
 
-The `audit.sh` script in this directory automates checking all OADP repos for configuration consistency. It fetches configs from `openshift/release` (or a local checkout with `--local`) and reports issues, warnings, and merge queue status.
+#### Go TUI (`tui/prow-audit-tui`)
+
+Interactive terminal dashboard for auditing Prow configs.
+
+```bash
+# Run directly (no clone needed, requires Go 1.22+)
+go run github.com/oadp-rebasebot/oadp-rebase/tools/prow-merge-bot-configs/tui@latest
+
+# Or build from source
+cd tui && go build -o prow-audit-tui .
+```
+
+```bash
+./prow-audit-tui                           # interactive TUI
+./prow-audit-tui --format text             # text output
+./prow-audit-tui --format json             # JSON output
+./prow-audit-tui --local /path/to/release  # use local checkout
+```
+
+Features:
+- **4-tab interface**: Config Audit, Merge Queue, Field Compare, Tide Branches
+- **Merge queue analysis**: detects tideErrLoopBlocker PRs ([prow#134](https://github.com/kubernetes-sigs/prow/issues/134)) that cause Tide error loops when `enforce_admins=true`
+- **Clickable interface**: `[m]` buttons, `🌐` globe links to config files with line numbers, double-click to open in browser
+- **Colorblind-friendly**: blue/orange/magenta/cyan palette with distinct icons for all statuses
+- **Collapsible sections**: groups, repos, and individual PRs
+
+See [`tui/README.md`](tui/README.md) for full keyboard/mouse reference.
+
+Requires Go 1.22+ and optionally `gh` CLI for merge queue checks.
+
+#### Bash Script (`audit.sh`)
+
+The original bash audit script. Still works for simple text/markdown output and interactive mode (bash 4+ required for interactive).
 
 ```
-./audit.sh [--branch main] [--format text|markdown] [--skip-queue] [--local <path>]
+./audit.sh [--branch main] [--format text|markdown|interactive] [--skip-queue] [--local <path>]
 ```
 
-The script categorizes repos into three groups with different expected configurations:
+Both tools categorize repos into three groups with different expected configurations:
 - **upstream-rebase**: Forks managed by rebasebot (expect `allow_force_pushes`, no `enforce_admins`)
 - **oadp-owned-openshift**: OADP-maintained repos in `openshift/` org (expect `enforce_admins`, review count)
 - **oadp-owned-migtools**: OADP-maintained repos in `migtools/` org (expect `enforce_admins`, review count)

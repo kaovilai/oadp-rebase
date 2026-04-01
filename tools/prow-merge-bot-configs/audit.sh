@@ -12,21 +12,27 @@
 # curl from raw.githubusercontent.com. Merge queue checks require `gh` CLI.
 #
 # Usage:
-#   ./audit.sh [--branch main] [--format text|markdown] [--skip-queue]
+#   ./audit.sh [--branch main] [--format text|markdown|interactive] [--skip-queue] [--local <path>]
 #
 # Environment:
 #   GITHUB_TOKEN  - optional, avoids GitHub API rate limits for raw content
+#                   auto-detected from `gh auth token` when gh CLI is available
 
 set -euo pipefail
 
 #
 # Defaults
 #
-FORMAT="text"
+FORMAT=""
 BRANCH="main"
 SKIP_QUEUE="false"
 LOCAL_RELEASE=""
 RAW_BASE="https://raw.githubusercontent.com/openshift/release"
+
+# Auto-detect GITHUB_TOKEN from gh CLI if not already set
+if [[ -z "${GITHUB_TOKEN:-}" ]] && command -v gh &>/dev/null; then
+  GITHUB_TOKEN="$(gh auth token 2>/dev/null)" || true
+fi
 
 #
 # OADP repos grouped by type. This determines what "baseline" config is expected.
@@ -98,15 +104,33 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     -h|--help)
-      echo "Usage: $0 [--branch main] [--format text|markdown] [--skip-queue] [--local <path>]"
+      echo "Usage: $0 [--branch main] [--format text|markdown|interactive] [--skip-queue] [--local <path>]"
       echo ""
       echo "Audits Prow merge bot configs across OADP ecosystem repositories."
       echo ""
       echo "Options:"
       echo "  --branch BRANCH   Branch of openshift/release to fetch from (default: main)"
-      echo "  --format FORMAT   Output format: text or markdown (default: text)"
+      echo "  --format FORMAT   Output format: text, markdown, or interactive"
+      echo "                    (default: interactive in terminal, text otherwise)"
       echo "  --skip-queue      Skip merge queue status check (requires gh CLI)"
       echo "  --local PATH      Use a local openshift/release checkout instead of fetching via curl"
+      echo ""
+      echo "Interactive mode keys:"
+      echo "  j/k, ↑/↓          Navigate up/down"
+      echo "  Enter/Space        Toggle section expand/collapse"
+      echo "  e/c                Expand/collapse all sections"
+      echo "  g/G                Jump to top/bottom"
+      echo "  f                  Toggle fullscreen (hide/show status bar)"
+      echo "  m                  Check merge queue for repo under cursor"
+      echo "  M                  Check merge queue for all repos (background)"
+      echo "  r                  Refresh all (re-run full audit)"
+      echo "  R                  Refresh repo under cursor only"
+      echo "  q                  Quit (prints output to terminal)"
+      echo ""
+      echo "Mouse support:"
+      echo "  Left click         Toggle section / click [r]efresh / click [m] for merge queue"
+      echo "  Right click        Refresh repo under cursor"
+      echo "  Scroll wheel       Navigate up/down"
       echo ""
       echo "Environment:"
       echo "  GITHUB_TOKEN      Optional token to avoid GitHub rate limits (ignored with --local)"
@@ -114,17 +138,56 @@ while [[ $# -gt 0 ]]; do
       ;;
     *)
       echo "Unknown option: $1" >&2
-      echo "Usage: $0 [--branch main] [--format text|markdown] [--skip-queue] [--local <path>]" >&2
+      echo "Usage: $0 [--branch main] [--format text|markdown|interactive] [--skip-queue] [--local <path>]" >&2
       exit 1
       ;;
   esac
 done
 
 #
+# Bash 4+ required for interactive mode (fractional read -t, associative arrays)
+#
+if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
+  if [[ "$FORMAT" == "interactive" ]]; then
+    echo "Error: Interactive mode requires bash 4+ (you have bash ${BASH_VERSION})." >&2
+    echo "  Install newer bash:  brew install bash" >&2
+    echo "  Or use text output:  $0 --format text" >&2
+    exit 1
+  fi
+  if [[ -z "$FORMAT" && -t 1 ]]; then
+    echo "Warning: bash ${BASH_VERSION} detected — interactive TUI requires bash 4+." >&2
+    echo "  Install newer bash:  brew install bash" >&2
+    echo "  Falling back to --format text." >&2
+    FORMAT="text"
+  fi
+fi
+
+#
+# Auto-detect format: interactive TUI if terminal + no explicit --format, else text
+#
+if [[ -z "$FORMAT" ]]; then
+  if [[ -t 1 ]]; then
+    FORMAT="interactive"
+  else
+    FORMAT="text"
+  fi
+fi
+
+#
 # Temp directory for fetched configs — cleaned up on exit
 #
 CACHE_DIR="$(mktemp -d)"
-cleanup() { rm -rf "$CACHE_DIR"; }
+cleanup() {
+  # Kill spinner if still running (read PID from file for subshell compatibility)
+  if [[ -n "${_SPINNER_PID_FILE:-}" && -f "$_SPINNER_PID_FILE" ]]; then
+    local pid
+    pid="$(cat "$_SPINNER_PID_FILE" 2>/dev/null)" || true
+    if [[ -n "$pid" ]]; then
+      kill "$pid" 2>/dev/null || true
+    fi
+  fi
+  rm -rf "$CACHE_DIR"
+}
 trap cleanup EXIT
 
 #
@@ -191,7 +254,7 @@ fetch_file() {
 #
 # Color helpers (disabled for markdown output or non-terminal)
 #
-if [[ "$FORMAT" == "text" ]] && [[ -t 1 ]]; then
+if [[ "$FORMAT" != "markdown" ]] && [[ -t 1 ]]; then
   RED='\033[0;31m'
   YELLOW='\033[0;33m'
   GREEN='\033[0;32m'
@@ -214,6 +277,672 @@ warning() { ((WARNINGS++)) || true; echo -e "${YELLOW}[WARN]${RESET}  $1"; }
 info()    { ((INFO++))     || true; echo -e "${CYAN}[INFO]${RESET}  $1"; }
 ok()      { echo -e "${GREEN}[OK]${RESET}    $1"; }
 section() { echo ""; echo -e "${BOLD}=== $1 ===${RESET}"; }
+
+#
+# Rate limit tracking (global, updated by fetch_rate_limit)
+#
+_RATE_REMAINING=""
+_RATE_LIMIT=""
+_RATE_RESET=""
+_RATE_RESET_HUMAN=""
+
+fetch_rate_limit() {
+  _RATE_REMAINING=""
+  _RATE_LIMIT=""
+  _RATE_RESET=""
+  _RATE_RESET_HUMAN=""
+
+  if ! command -v gh &>/dev/null || ! command -v jq &>/dev/null; then
+    return 0
+  fi
+
+  local rate_json
+  rate_json="$(gh api rate_limit 2>/dev/null)" || return 0
+
+  _RATE_REMAINING="$(echo "$rate_json" | jq -r '.resources.core.remaining' 2>/dev/null)" || true
+  _RATE_LIMIT="$(echo "$rate_json" | jq -r '.resources.core.limit' 2>/dev/null)" || true
+  _RATE_RESET="$(echo "$rate_json" | jq -r '.resources.core.reset' 2>/dev/null)" || true
+
+  if [[ -n "$_RATE_RESET" && "$_RATE_RESET" != "null" ]]; then
+    # macOS: date -r EPOCH; Linux: date -d @EPOCH
+    _RATE_RESET_HUMAN="$(date -u -r "$_RATE_RESET" +%H:%M 2>/dev/null)" \
+      || _RATE_RESET_HUMAN="$(date -u -d "@$_RATE_RESET" +%H:%M 2>/dev/null)" \
+      || _RATE_RESET_HUMAN=""
+  fi
+}
+
+#
+# TUI interactive viewer — collapsible sections, keyboard navigation
+#
+tui_viewer() {
+  local input_file="$1"
+  _TUI_INPUT_FILE="$input_file"  # global copy for trap handler
+  _TUI_ACTION="quit"
+  _REFRESH_REPO=""
+  _MERGE_QUEUE_REPO=""
+  local -a lines=()
+  local -a is_header=()       # 1 if line is a section header, 0 otherwise
+  local -a section_id=()      # section index for each line (-1 if before first section)
+  local -a collapsed=()       # 1 if section is collapsed
+  local -a line_repo_cache=() # cached repo name per line (empty if none)
+  local num_sections=0
+  local current_section=-1
+
+  # Detect a repo name (org/repo) on a given line of text
+  detect_repo_on_line() {
+    local text="$1"
+    local all_repos=(
+      "${UPSTREAM_REBASE_REPOS[@]}"
+      "${OADP_OWNED_OPENSHIFT_REPOS[@]}"
+      "${OADP_OWNED_MIGTOOLS_REPOS[@]}"
+      ${NO_PROW_CONFIG_REPOS[@]+"${NO_PROW_CONFIG_REPOS[@]}"}
+    )
+    local repo
+    for repo in "${all_repos[@]}"; do
+      if [[ "$text" == *"$repo"* ]]; then
+        echo "$repo"
+        return 0
+      fi
+    done
+    return 1
+  }
+
+  # Parse input into lines and identify section headers
+  local strip_ansi_re=$'s/\033\[[0-9;]*m//g'
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    lines+=("$line")
+    local stripped
+    stripped="$(echo "$line" | sed "$strip_ansi_re")"
+    # Cache repo detection per line
+    local _detected_repo=""
+    _detected_repo="$(detect_repo_on_line "$stripped")" || true
+    line_repo_cache+=("$_detected_repo")
+    if [[ "$stripped" =~ ^===\ .+\ ===$ ]]; then
+      is_header+=("1")
+      current_section=$num_sections
+      section_id+=("$current_section")
+      collapsed+=("0")
+      ((num_sections++)) || true
+    else
+      is_header+=("0")
+      section_id+=("$current_section")
+    fi
+  done < "$input_file"
+
+  local total=${#lines[@]}
+  if (( total == 0 )); then
+    return 0
+  fi
+
+  # Build visible lines list based on collapsed state
+  local -a visible=()   # indices into lines[]
+  build_visible() {
+    visible=()
+    local i sid
+    for (( i = 0; i < total; i++ )); do
+      if [[ "${is_header[$i]}" == "1" ]]; then
+        visible+=("$i")
+      elif [[ "${section_id[$i]}" == "-1" ]]; then
+        # Lines before first section — always visible
+        visible+=("$i")
+      else
+        sid="${section_id[$i]}"
+        if [[ "${collapsed[$sid]}" == "0" ]]; then
+          visible+=("$i")
+        fi
+      fi
+    done
+  }
+
+  build_visible
+
+  if [[ ${#visible[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  # Track file line count for live reload (merge queue appends in background)
+  local _last_line_count=$total
+
+  # Reload new lines from input file if it has grown (preserves collapse state)
+  reload_if_changed() {
+    local current_count
+    current_count="$(wc -l < "$input_file" 2>/dev/null | tr -d ' ')" || return
+    # Account for final line without trailing newline (matches initial parse behavior)
+    if [[ -s "$input_file" ]] && [[ "$(tail -c1 "$input_file" 2>/dev/null)" != "" ]]; then
+      current_count=$(( current_count + 1 ))
+    fi
+    if [[ "$current_count" -le "$_last_line_count" ]]; then
+      return
+    fi
+
+    # Read only new lines using process substitution (avoids subshell)
+    local new_line
+    while IFS= read -r new_line || [[ -n "$new_line" ]]; do
+      lines+=("$new_line")
+      local stripped
+      stripped="$(echo "$new_line" | sed "$strip_ansi_re")"
+      # Cache repo detection for new line
+      local _detected_repo=""
+      _detected_repo="$(detect_repo_on_line "$stripped")" || true
+      line_repo_cache+=("$_detected_repo")
+      if [[ "$stripped" =~ ^===\ .+\ ===$ ]]; then
+        is_header+=("1")
+        current_section=$num_sections
+        section_id+=("$current_section")
+        collapsed+=("0")
+        ((num_sections++)) || true
+      else
+        is_header+=("0")
+        section_id+=("$current_section")
+      fi
+    done < <(tail -n "+$((_last_line_count + 1))" "$input_file" 2>/dev/null)
+
+    total=${#lines[@]}
+    _last_line_count=$current_count
+    build_visible
+    clamp_cursor
+  }
+
+  local cursor=0
+  local scroll=0
+  local _fullscreen=0
+  local term_rows term_cols view_rows
+  term_rows="$(tput lines 2>/dev/null)" || term_rows=24
+  term_cols="$(tput cols 2>/dev/null)" || term_cols=80
+  view_rows=$(( term_rows - 2 ))  # reserve 1 for status bar, 1 for padding
+
+  # Enter alternate screen, hide cursor, enable mouse
+  tput smcup 2>/dev/null || true
+  tput civis 2>/dev/null || true
+  printf '\x1b[?1000h\x1b[?1006h' 2>/dev/null || true  # SGR mouse reporting
+
+  # Restore terminal on exit
+  TUI_CLEANUP_DONE=0
+  tui_restore_term() {
+    if [[ "${TUI_CLEANUP_DONE:-0}" == "0" ]]; then
+      TUI_CLEANUP_DONE=1
+      printf '\x1b[?1000l\x1b[?1006l' 2>/dev/null || true  # disable mouse
+      tput cnorm 2>/dev/null || true
+      tput rmcup 2>/dev/null || true
+    fi
+  }
+  # On unexpected exit: restore terminal, print output, then chain to original cleanup
+  tui_trap() {
+    tui_restore_term
+    cat "${_TUI_INPUT_FILE:-}" 2>/dev/null || true
+    cleanup 2>/dev/null || true
+  }
+  trap tui_trap EXIT INT TERM
+
+  # Read interactive input from the terminal directly
+  exec 4</dev/tty
+
+  # Update terminal size (called on SIGWINCH and at start)
+  local _term_dirty=1
+  update_term_size() { _term_dirty=1; }
+  trap update_term_size WINCH
+
+  render() {
+    # Only re-read terminal size when it changed
+    if [[ $_term_dirty -eq 1 ]]; then
+      term_rows="$(tput lines 2>/dev/null)" || term_rows=24
+      term_cols="$(tput cols 2>/dev/null)" || term_cols=80
+      if [[ $_fullscreen -eq 1 ]]; then
+        view_rows=$term_rows
+      else
+        view_rows=$(( term_rows - 2 ))
+      fi
+      if [[ $view_rows -lt 1 ]]; then view_rows=1; fi
+      _term_dirty=0
+    fi
+
+    # Adjust scroll to keep cursor visible
+    if [[ $cursor -lt $scroll ]]; then
+      scroll=$cursor
+    elif [[ $cursor -ge $(( scroll + view_rows )) ]]; then
+      scroll=$(( cursor - view_rows + 1 ))
+    fi
+
+    local max_scroll=$(( ${#visible[@]} - view_rows ))
+    if [[ $max_scroll -lt 0 ]]; then max_scroll=0; fi
+    if [[ $scroll -gt $max_scroll ]]; then scroll=$max_scroll; fi
+
+    # Build full frame in buffer, then write at once (reduces flicker)
+    local buf=""
+    buf+='\033[2J\033[H'
+
+    # [m] button is 3 chars + 1 space padding, right-aligned
+    _mq_btn_col=$(( term_cols - 3 ))  # 1-based column where [m] starts
+    _row_repo=()
+
+    local row vi li line prefix max_line_len display_line sid
+    max_line_len=$(( term_cols - 7 ))  # leave room for " [m]" at right edge
+    for (( row = 0; row < view_rows; row++ )); do
+      vi=$(( scroll + row ))
+      if [[ $vi -ge ${#visible[@]} ]]; then
+        buf+=$'\n'
+        continue
+      fi
+      li="${visible[$vi]}"
+      line="${lines[$li]}"
+
+      if [[ "${is_header[$li]}" == "1" ]]; then
+        sid="${section_id[$li]}"
+        if [[ "${collapsed[$sid]}" == "1" ]]; then
+          prefix="▶ "
+        else
+          prefix="▼ "
+        fi
+      else
+        prefix="  "
+      fi
+
+      # Use cached repo detection for [m] button
+      local line_repo="${line_repo_cache[$li]:-}"
+      local screen_row=$(( row + 1 ))  # 1-based for mouse coords
+
+      # Truncate to terminal width (leaving space for [m] button if repo detected)
+      if [[ -n "$line_repo" ]]; then
+        display_line="${line:0:$max_line_len}"
+        _row_repo[$screen_row]="$line_repo"
+      else
+        display_line="${line:0:$(( term_cols - 3 ))}"
+      fi
+
+      if [[ $vi -eq $cursor ]]; then
+        if [[ -n "$line_repo" ]]; then
+          buf+="\033[7m${prefix}${display_line}\033[0m"
+          # Right-align [m] button
+          buf+="\033[${screen_row};${_mq_btn_col}H\033[36m[m]\033[0m"$'\n'
+        else
+          buf+="\033[7m${prefix}${display_line}\033[0m"$'\n'
+        fi
+      else
+        if [[ -n "$line_repo" ]]; then
+          buf+="${prefix}${display_line}"
+          buf+="\033[${screen_row};${_mq_btn_col}H\033[36m[m]\033[0m"$'\n'
+        else
+          buf+="${prefix}${display_line}"$'\n'
+        fi
+      fi
+    done
+
+    # Status bar at bottom (hidden in fullscreen mode)
+    if [[ $_fullscreen -eq 0 ]]; then
+      buf+="\033[${term_rows};1H"
+
+      local status_left=" ↑↓/jk: nav │ click: toggle │ e/c: all"
+      local status_rate=""
+      if [[ -n "${_RATE_REMAINING:-}" && -n "${_RATE_LIMIT:-}" ]]; then
+        if [[ "${_RATE_REMAINING:-0}" -le 0 ]] 2>/dev/null; then
+          status_rate=" │ \033[31mAPI: ${_RATE_REMAINING}/${_RATE_LIMIT}"
+          if [[ -n "${_RATE_RESET_HUMAN:-}" ]]; then
+            status_rate+=" until ${_RATE_RESET_HUMAN}UTC"
+          fi
+          status_rate+="\033[0m\033[7m"
+        elif [[ "${_RATE_REMAINING:-0}" -lt 100 ]] 2>/dev/null; then
+          status_rate=" │ \033[33mAPI: ${_RATE_REMAINING}/${_RATE_LIMIT}"
+          if [[ -n "${_RATE_RESET_HUMAN:-}" ]]; then
+            status_rate+=" resets ${_RATE_RESET_HUMAN}UTC"
+          fi
+          status_rate+="\033[0m\033[7m"
+        else
+          status_rate=" │ API: ${_RATE_REMAINING}/${_RATE_LIMIT}"
+        fi
+      fi
+
+      local status_loading=""
+      if [[ -n "${_MERGE_QUEUE_BG_PID:-}" ]] && kill -0 "$_MERGE_QUEUE_BG_PID" 2>/dev/null; then
+        status_loading=" │ \033[33mloading...\033[0m\033[7m"
+      fi
+      local status_right=" │ m: queue │ M: all${status_loading} │ [r]efresh │ q: quit "
+      buf+="\033[7m${status_left}${status_rate}${status_right}\033[0m"
+
+      # Compute refresh button click target from full prefix before "[r]efresh"
+      local status_before_refresh="${status_left}${status_rate} │ m: queue │ M: all${status_loading} │ "
+      local status_before_plain
+      status_before_plain="$(printf '%b' "$status_before_refresh" | sed "$strip_ansi_re")"
+      _status_bar_row=$term_rows
+      _refresh_col_start=$(( ${#status_before_plain} + 1 ))  # 1-based column
+      _refresh_col_end=$(( _refresh_col_start + 8 ))          # "[r]efresh" = 9 chars
+    fi
+
+    printf '%b' "$buf"
+  }
+
+  render
+
+  # Helper to clamp cursor to visible bounds
+  clamp_cursor() {
+    if [[ $cursor -ge ${#visible[@]} ]]; then
+      cursor=$(( ${#visible[@]} - 1 ))
+    fi
+    if [[ $cursor -lt 0 ]]; then cursor=0; fi
+  }
+
+  # Returns 0 to continue, 1 to quit
+  local _quit=0
+  handle_key() {
+    local key="$1"
+    case "$key" in
+      q)
+        _TUI_ACTION="quit"
+        _quit=1
+        ;;
+      r)
+        _TUI_ACTION="refresh"
+        _REFRESH_REPO=""
+        _quit=1
+        ;;
+      R)
+        # Single-repo refresh: detect repo from current line
+        if [[ $cursor -lt ${#visible[@]} ]]; then
+          local cur_li="${visible[$cursor]}"
+          local cur_line="${lines[$cur_li]}"
+          local stripped
+          stripped="$(echo "$cur_line" | sed "$strip_ansi_re")"
+          local detected=""
+          detected="$(detect_repo_on_line "$stripped")" || true
+          if [[ -n "$detected" ]]; then
+            _TUI_ACTION="refresh"
+            _REFRESH_REPO="$detected"
+            _quit=1
+          fi
+        fi
+        ;;
+      j)
+        if [[ $cursor -lt $(( ${#visible[@]} - 1 )) ]]; then
+          cursor=$(( cursor + 1 ))
+        fi
+        ;;
+      k)
+        if [[ $cursor -gt 0 ]]; then
+          cursor=$(( cursor - 1 ))
+        fi
+        ;;
+      g)
+        cursor=0
+        scroll=0
+        ;;
+      G)
+        cursor=$(( ${#visible[@]} - 1 ))
+        ;;
+      f)
+        if [[ $_fullscreen -eq 0 ]]; then _fullscreen=1; else _fullscreen=0; fi
+        _term_dirty=1
+        ;;
+      e)
+        local si
+        for (( si = 0; si < num_sections; si++ )); do
+          collapsed[$si]="0"
+        done
+        build_visible
+        clamp_cursor
+        ;;
+      c)
+        local si
+        for (( si = 0; si < num_sections; si++ )); do
+          collapsed[$si]="1"
+        done
+        build_visible
+        clamp_cursor
+        ;;
+      m)
+        # Single-repo merge queue check: detect repo from current line
+        if [[ $cursor -lt ${#visible[@]} ]]; then
+          local cur_li="${visible[$cursor]}"
+          local cur_line="${lines[$cur_li]}"
+          local stripped
+          stripped="$(echo "$cur_line" | sed "$strip_ansi_re")"
+          local detected=""
+          detected="$(detect_repo_on_line "$stripped")" || true
+          if [[ -n "$detected" ]]; then
+            _TUI_ACTION="merge_queue"
+            _MERGE_QUEUE_REPO="$detected"
+            _quit=1
+          fi
+        fi
+        ;;
+      M)
+        # Check merge queue for all repos
+        _TUI_ACTION="merge_queue_all"
+        _quit=1
+        ;;
+      "" | " ")  # Enter or Space
+        if [[ $cursor -lt ${#visible[@]} ]]; then
+          local vi_line="${visible[$cursor]}"
+          if [[ "${is_header[$vi_line]}" == "1" ]]; then
+            local sid="${section_id[$vi_line]}"
+            if [[ "${collapsed[$sid]}" == "1" ]]; then
+              collapsed[$sid]="0"
+            else
+              collapsed[$sid]="1"
+            fi
+            build_visible
+            clamp_cursor
+          fi
+        fi
+        ;;
+    esac
+  }
+
+
+
+  # Click target tracking (set by render, read by handle_mouse)
+  local _status_bar_row=0
+  local _refresh_col_start=0
+  local _refresh_col_end=0
+  # Per-row merge queue button: maps screen row (1-based) to repo name
+  local -a _row_repo=()
+  local _mq_btn_col=0  # column where [m] buttons start (set by render)
+
+  # Handle mouse events (SGR format: button;col;row)
+  handle_mouse() {
+    local params="$1" terminator="$2"
+    # Only act on press events (M), ignore release (m)
+    [[ "$terminator" != "M" ]] && return
+
+    local button col row
+    IFS=';' read -r button col row <<< "$params"
+
+    # Validate numeric
+    [[ "$button" =~ ^[0-9]+$ && "$col" =~ ^[0-9]+$ && "$row" =~ ^[0-9]+$ ]] || return
+
+    case "$button" in
+      64) handle_key k ;;  # Scroll wheel up
+      65) handle_key j ;;  # Scroll wheel down
+      0)  # Left click
+        # Check refresh button in status bar
+        if [[ $row -eq $_status_bar_row && $col -ge $_refresh_col_start && $col -le $_refresh_col_end ]]; then
+          _TUI_ACTION="refresh"
+          _REFRESH_REPO=""
+          _quit=1
+          return
+        fi
+        # Check [m] merge queue button on repo lines
+        if [[ $col -ge $_mq_btn_col && $col -le $(( _mq_btn_col + 2 )) && -n "${_row_repo[$row]:-}" ]]; then
+          _TUI_ACTION="merge_queue"
+          _MERGE_QUEUE_REPO="${_row_repo[$row]}"
+          _quit=1
+          return
+        fi
+        # Map click to visible line
+        local clicked_vi=$(( scroll + row - 1 ))  # row is 1-based
+        if [[ $clicked_vi -ge 0 && $clicked_vi -lt ${#visible[@]} ]]; then
+          cursor=$clicked_vi
+          local clicked_li="${visible[$clicked_vi]}"
+          if [[ "${is_header[$clicked_li]}" == "1" ]]; then
+            local sid="${section_id[$clicked_li]}"
+            if [[ "${collapsed[$sid]}" == "1" ]]; then
+              collapsed[$sid]="0"
+            else
+              collapsed[$sid]="1"
+            fi
+            build_visible
+            clamp_cursor
+          fi
+        fi
+        ;;
+      2)  # Right click — single-repo refresh
+        local clicked_vi=$(( scroll + row - 1 ))
+        if [[ $clicked_vi -ge 0 && $clicked_vi -lt ${#visible[@]} ]]; then
+          local clicked_li="${visible[$clicked_vi]}"
+          local clicked_line="${lines[$clicked_li]}"
+          local stripped
+          stripped="$(echo "$clicked_line" | sed "$strip_ansi_re")"
+          local detected_repo=""
+          detected_repo="$(detect_repo_on_line "$stripped")" || true
+          if [[ -n "$detected_repo" ]]; then
+            _TUI_ACTION="refresh"
+            _REFRESH_REPO="$detected_repo"
+            _quit=1
+          fi
+        fi
+        ;;
+    esac
+  }
+
+  # Parse escape sequences and dispatch
+  handle_escape() {
+    local seq=""
+    IFS= read -rsn1 -t 0.3 -u4 seq || true
+    if [[ "$seq" == "[" ]]; then
+      IFS= read -rsn1 -t 0.3 -u4 seq || true
+      case "$seq" in
+        A) handle_key k ;;   # Up arrow
+        B) handle_key j ;;   # Down arrow
+        C|D) ;;              # Left/Right arrow — ignore
+        '<')  # SGR mouse event: \x1b[<button;col;rowM/m
+          local sgr_buf="" sgr_char="" sgr_count=0
+          while (( sgr_count++ < 32 )) && IFS= read -rsn1 -t 0.1 -u4 sgr_char; do
+            if [[ "$sgr_char" == "M" || "$sgr_char" == "m" ]]; then
+              handle_mouse "$sgr_buf" "$sgr_char"
+              break
+            fi
+            sgr_buf+="$sgr_char"
+          done
+          ;;
+        M)  # Legacy X10 mouse — consume 3 bytes individually
+          local _x10_i=0
+          while (( _x10_i++ < 3 )); do IFS= read -rsn1 -t 0.1 -u4 _ || break; done
+          ;;
+        *)  # Unknown CSI — drain (limit to 32 chars)
+          local _csi_drain=0
+          while (( _csi_drain++ < 32 )) && IFS= read -rsn1 -t 0.1 -u4 _ 2>/dev/null; do :; done
+          ;;
+      esac
+    elif [[ "$seq" == "O" ]]; then
+      IFS= read -rsn1 -t 0.3 -u4 seq || true
+      case "$seq" in
+        A) handle_key k ;; B) handle_key j ;; *) ;;
+      esac
+    fi
+  }
+
+  # Main input loop — read from /dev/tty via fd 4
+  # Uses timeout so we can periodically check for new file content (background merge queue)
+  local key=""
+  while true; do
+    if IFS= read -rsn1 -t 0.5 -u4 key 2>/dev/null; then
+      if [[ "$key" == $'\x1b' ]]; then
+        handle_escape
+      else
+        handle_key "$key"
+      fi
+      [[ $_quit -eq 1 ]] && break
+
+      # Drain queued input before re-rendering (prevents scroll flood, max 64 events)
+      local _drain=0
+      while (( _drain++ < 64 )) && IFS= read -rsn1 -t 0.01 -u4 key 2>/dev/null; do
+        if [[ "$key" == $'\x1b' ]]; then
+          handle_escape
+        else
+          handle_key "$key"
+        fi
+        [[ $_quit -eq 1 ]] && break
+      done
+      [[ $_quit -eq 1 ]] && break
+    fi
+
+    # Check for new content from background processes
+    reload_if_changed
+
+    render
+  done
+
+  exec 4<&-
+
+  # Restore terminal, then print output to scrollback (before cleanup deletes temp dir)
+  tui_restore_term
+  cat "$input_file"
+
+  # Restore original cleanup trap (tui_trap no longer needed)
+  trap cleanup EXIT
+}
+
+#
+# Interactive mode: capture stdout to temp file for TUI viewer
+#
+TUI_OUTPUT=""
+_SPINNER_PID_FILE=""
+
+_start_spinner() {
+  _stop_spinner
+  local msg="$1"
+  (
+    while true; do
+      printf '\r\033[K  %s   ' "$msg" >&3
+      sleep 0.3
+      printf '\r\033[K  %s.  ' "$msg" >&3
+      sleep 0.3
+      printf '\r\033[K  %s.. ' "$msg" >&3
+      sleep 0.3
+      printf '\r\033[K  %s...' "$msg" >&3
+      sleep 0.3
+    done
+  ) &
+  local pid=$!
+  disown "$pid" 2>/dev/null || true
+  # Write PID to file so subshells (pipelines) can track it
+  if [[ -n "${_SPINNER_PID_FILE:-}" ]]; then
+    echo "$pid" > "$_SPINNER_PID_FILE"
+  fi
+}
+
+_stop_spinner() {
+  if [[ -n "${_SPINNER_PID_FILE:-}" && -f "$_SPINNER_PID_FILE" ]]; then
+    local pid
+    pid="$(cat "$_SPINNER_PID_FILE" 2>/dev/null)" || true
+    if [[ -n "$pid" ]]; then
+      kill "$pid" 2>/dev/null || true
+      printf '\r\033[K' >&3 2>/dev/null || true
+    fi
+    rm -f "$_SPINNER_PID_FILE"
+  fi
+}
+
+if [[ "$FORMAT" == "interactive" ]]; then
+  TUI_OUTPUT="$CACHE_DIR/tui-output.txt"
+  _SPINNER_PID_FILE="$CACHE_DIR/.spinner-pid"
+  exec 3>&1 1>"$TUI_OUTPUT"
+
+  # Override section() to show loading progress on terminal
+  section() {
+    _stop_spinner
+    echo ""; echo -e "${BOLD}=== $1 ===${RESET}"
+    _start_spinner "$1"
+  }
+
+  # Show current repo/PR being processed under the section spinner
+  _show_status() {
+    _stop_spinner
+    _start_spinner "$1"
+  }
+
+  _start_spinner "Initializing audit"
+else
+  _show_status() { :; }
+fi
 
 #
 # YAML value extraction (simple grep-based, avoids yq dependency)
@@ -531,6 +1260,12 @@ compare_field() {
 # Main
 #
 
+fetch_rate_limit
+
+run_audit() {
+# Reset counters for refresh
+ISSUES=0; WARNINGS=0; INFO=0
+
 # --- Prefetch all configs ---
 echo -e "${BOLD}Prow Merge Bot Configuration Audit${RESET}"
 if [[ -n "$LOCAL_RELEASE" ]]; then
@@ -551,6 +1286,7 @@ ALL_REPOS_TO_FETCH=(
 
 FETCH_ERRORS=0
 for repo in "${ALL_REPOS_TO_FETCH[@]}"; do
+  _show_status "Fetching configs: $repo"
   fetch_configs "$repo" || ((FETCH_ERRORS++)) || true
 done
 echo " done (${#ALL_REPOS_TO_FETCH[@]} repos, $FETCH_ERRORS without configs)"
@@ -571,6 +1307,7 @@ echo "These repos are forks of upstream projects managed by rebasebot."
 echo "They intentionally allow force pushes and typically lack strict branch protection."
 echo ""
 for repo in "${UPSTREAM_REBASE_REPOS[@]}"; do
+  _show_status "Checking $repo"
   audit_repo "$repo" "upstream-rebase"
 done
 
@@ -579,6 +1316,7 @@ section "OADP-Owned Repos (openshift/ org)"
 echo "These repos should have enforce_admins, review count, and dismiss_stale_reviews."
 echo ""
 for repo in "${OADP_OWNED_OPENSHIFT_REPOS[@]}"; do
+  _show_status "Checking $repo"
   audit_repo "$repo" "oadp-owned-openshift"
 done
 
@@ -588,6 +1326,7 @@ echo "These repos should have enforce_admins, review count, and dismiss_stale_re
 echo "Note: migtools repos list plugins explicitly (no org-level inheritance)."
 echo ""
 for repo in "${OADP_OWNED_MIGTOOLS_REPOS[@]}"; do
+  _show_status "Checking $repo"
   audit_repo "$repo" "oadp-owned-migtools"
 done
 
@@ -643,141 +1382,159 @@ for repo in "${ALL_REPOS[@]}"; do
   fi
 done
 
-# --- Merge queue status ---
-if [[ "$SKIP_QUEUE" != "true" ]]; then
-  section "Merge Queue Status"
+# --- Summary (config audit only — merge queue updates these counters too) ---
+section "Summary"
+echo -e "Issues:   ${RED}$ISSUES${RESET}"
+echo -e "Warnings: ${YELLOW}$WARNINGS${RESET}"
+echo -e "Info:     ${CYAN}$INFO${RESET}"
 
+if (( ISSUES > 0 )); then
+  echo ""
+  echo "Issues indicate missing or broken configuration that should be fixed."
+fi
+if (( WARNINGS > 0 )); then
+  echo ""
+  echo "Warnings indicate deviations from the expected pattern for the repo type."
+  echo "Some may be intentional — review each case."
+fi
+
+if [[ "$FORMAT" == "interactive" && "$SKIP_QUEUE" != "true" ]]; then
+  echo ""
+  echo "Press m on a repo line to check its merge queue, or M to check all repos."
+fi
+}
+
+#
+# Check merge queue for a single repo. Outputs results to stdout.
+# Usage: check_merge_queue_repo "org/repo"
+#
+check_merge_queue_repo() {
+  local repo="$1"
+  if ! has_config "$repo"; then return; fi
   if ! command -v gh &>/dev/null; then
-    warning "gh CLI not found — skipping merge queue check (use --skip-queue to suppress)"
-  else
-    echo "PRs with approved+lgtm labels that haven't merged yet."
-    echo "Tide merges one PR at a time per branch per repo; others wait in queue."
-    echo ""
+    echo -e "  ${YELLOW}WARNING${RESET} gh CLI not found — cannot check merge queue"
+    return
+  fi
 
-    PROW_BASE="https://prow.ci.openshift.org"
+  local org="${repo%%/*}"
+  local reponame="${repo##*/}"
 
-    QUEUE_TOTAL=0
+  _show_status "Merge queue: $repo"
 
-    for repo in "${ALL_REPOS[@]}"; do
-      if ! has_config "$repo"; then continue; fi
+  # Fetch open PRs with approved+lgtm (include reviews for ack check)
+  local pr_json
+  pr_json="$(gh pr list --repo "$repo" --state open --label approved --label lgtm \
+    --json number,headRefName,baseRefName,author,title,labels,statusCheckRollup,reviews \
+    2>/dev/null)" || return
 
-      # Fetch open PRs with approved+lgtm (include reviews for ack check)
-      pr_json="$(gh pr list --repo "$repo" --state open --label approved --label lgtm \
-        --json number,headRefName,baseRefName,author,title,labels,statusCheckRollup,reviews \
-        2>/dev/null)" || continue
+  local pr_count
+  pr_count="$(echo "$pr_json" | jq 'length')"
+  if [[ "$pr_count" == "0" ]]; then
+    echo -e "  ${BOLD}$repo${RESET}: No PRs in merge queue"
+    return
+  fi
 
-      pr_count="$(echo "$pr_json" | jq 'length')"
-      if [[ "$pr_count" == "0" ]]; then continue; fi
+  # Get required review count and enforce_admins for this repo from prow config
+  local required_reviews enforce
+  required_reviews="$(get_review_count "$repo")"
+  enforce="$(get_enforce_admins "$repo")"
 
-      org="${repo%%/*}"
-      reponame="${repo##*/}"
+  echo -e "  ${BOLD}$repo${RESET} ($pr_count PRs with approved+lgtm)"
+  if [[ "$required_reviews" != "NOT_SET" && "$required_reviews" != "MISSING_FILE" ]]; then
+    echo "  Required GitHub reviews: $required_reviews (enforce_admins: ${enforce})"
+  fi
 
-      # Get required review count and enforce_admins for this repo from prow config
-      required_reviews="$(get_review_count "$repo")"
-      enforce="$(get_enforce_admins "$repo")"
+  # Prow Tide query link for this repo
+  local PROW_BASE="https://prow.ci.openshift.org"
+  local prow_tide_url="${PROW_BASE}/tide?query=is%3Apr+state%3Aopen+repo%3A${org}%2F${reponame}"
+  echo "  Tide: $prow_tide_url"
+  echo ""
 
-      echo -e "  ${BOLD}$repo${RESET} ($pr_count PRs with approved+lgtm)"
-      if [[ "$required_reviews" != "NOT_SET" && "$required_reviews" != "MISSING_FILE" ]]; then
-        echo "  Required GitHub reviews: $required_reviews (enforce_admins: ${enforce})"
+  # Normalize statusCheckRollup into unified format
+  local NORMALIZE_CHECKS_JQ='[.statusCheckRollup[] |
+    {
+      check_name: (.name // .context),
+      check_state: (
+        if .status == "COMPLETED" then (.conclusion // "UNKNOWN")
+        elif .status == "IN_PROGRESS" then "IN_PROGRESS"
+        elif .status == "QUEUED" then "PENDING"
+        elif .state != null then (if .state == "SUCCESS" then "SUCCESS" elif .state == "FAILURE" then "FAILURE" elif .state == "ERROR" then "ERROR" else "PENDING" end)
+        elif .status != null then .status
+        else "PENDING"
+        end
+      )
+    }
+  ]'
+
+  # Pre-scan for review blockers
+  local review_blockers_file
+  review_blockers_file="$(mktemp)"
+
+  if [[ "$required_reviews" != "NOT_SET" && "$required_reviews" != "MISSING_FILE" && "$enforce" == "true" ]]; then
+    echo "$pr_json" | jq -c '.[]' | while IFS= read -r _pr; do
+      local _base _num _approvals _tide _short
+      _base="$(echo "$_pr" | jq -r '.baseRefName')"
+      _num="$(echo "$_pr" | jq -r '.number')"
+      _approvals="$(echo "$_pr" | jq -r '
+        [.reviews[] | {login: .author.login, state: .state, at: .submittedAt}]
+        | group_by(.login) | map(sort_by(.at) | last)
+        | map(select(.state == "APPROVED")) | length')"
+      _tide="$(echo "$_pr" | jq -r "$NORMALIZE_CHECKS_JQ" | jq -r '[.[] | select(.check_name == "tide") | .check_state] | first // "NOT_REPORTED"')"
+      if (( _approvals < required_reviews )) && [[ "$_tide" == "SUCCESS" ]]; then
+        _short=$((required_reviews - _approvals))
+        echo "${_base}|${_num}|${_short}" >> "$review_blockers_file"
       fi
+    done
+  fi
 
-      # Prow Tide query link for this repo
-      prow_tide_url="${PROW_BASE}/tide?query=is%3Apr+state%3Aopen+repo%3A${org}%2F${reponame}"
-      echo "  Tide: $prow_tide_url"
-      echo ""
+  echo "$pr_json" | jq -c '.[]' | while IFS= read -r pr; do
+    local pr_num pr_author pr_title pr_branch pr_base pr_labels
+    pr_num="$(echo "$pr" | jq -r '.number')"
+    _show_status "Merge queue: $repo #$pr_num"
+    pr_author="$(echo "$pr" | jq -r '.author.login')"
+    pr_title="$(echo "$pr" | jq -r '.title')"
+    pr_branch="$(echo "$pr" | jq -r '.headRefName')"
+    pr_base="$(echo "$pr" | jq -r '.baseRefName')"
+    pr_labels="$(echo "$pr" | jq -r '[.labels[].name] | join(",")')"
 
-      # Normalize statusCheckRollup into unified format:
-      #   GitHub Checks API entries have: name, status (COMPLETED/IN_PROGRESS/QUEUED), conclusion (SUCCESS/FAILURE/...)
-      #   GitHub commit status entries have: context, state (SUCCESS/PENDING/FAILURE/ERROR)
-      # We normalize to: {check_name, check_state} where check_state is one of: SUCCESS, FAILURE, PENDING, IN_PROGRESS, ERROR
-      NORMALIZE_CHECKS_JQ='[.statusCheckRollup[] |
-        {
-          check_name: (.name // .context),
-          check_state: (
-            if .status == "COMPLETED" then (.conclusion // "UNKNOWN")
-            elif .status == "IN_PROGRESS" then "IN_PROGRESS"
-            elif .status == "QUEUED" then "PENDING"
-            elif .state != null then (if .state == "SUCCESS" then "SUCCESS" elif .state == "FAILURE" then "FAILURE" elif .state == "ERROR" then "ERROR" else "PENDING" end)
-            elif .status != null then .status
-            else "PENDING"
-            end
-          )
-        }
-      ]'
+    # Check GitHub approving reviews vs required count
+    local approving_reviewers approval_count
+    approving_reviewers="$(echo "$pr" | jq -r '
+      [.reviews[] | {login: .author.login, state: .state, at: .submittedAt}]
+      | group_by(.login)
+      | map(sort_by(.at) | last)
+      | map(select(.state == "APPROVED") | .login)
+      | .[]')"
+    approval_count=0
+    if [[ -n "$approving_reviewers" ]]; then
+      approval_count="$(echo "$approving_reviewers" | wc -l | tr -d ' ')"
+    fi
 
-      # Pre-scan: identify PRs that will block the Tide queue due to insufficient
-      # reviews. Tide picks the first eligible PR per branch; if that PR has
-      # approved+lgtm but not enough GitHub reviews, enforce_admins causes the
-      # merge API call to fail, blocking all PRs behind it on the same branch.
-      # We build a lookup: base_branch -> "blocker PR numbers and review needs"
-      # stored in a temp file as "base_branch|pr_num|reviews_short" lines.
-      review_blockers_file="$(mktemp)"
+    # Normalize checks
+    local checks failing errored pending in_progress tide_state
+    checks="$(echo "$pr" | jq -c "$NORMALIZE_CHECKS_JQ")"
 
-      if [[ "$required_reviews" != "NOT_SET" && "$required_reviews" != "MISSING_FILE" && "$enforce" == "true" ]]; then
-        echo "$pr_json" | jq -c '.[]' | while IFS= read -r _pr; do
-          _base="$(echo "$_pr" | jq -r '.baseRefName')"
-          _num="$(echo "$_pr" | jq -r '.number')"
-          _approvals="$(echo "$_pr" | jq -r '
-            [.reviews[] | {login: .author.login, state: .state, at: .submittedAt}]
-            | group_by(.login) | map(sort_by(.at) | last)
-            | map(select(.state == "APPROVED")) | length')"
-          # Check tide state
-          _tide="$(echo "$_pr" | jq -r "$NORMALIZE_CHECKS_JQ" | jq -r '[.[] | select(.check_name == "tide") | .check_state] | first // "NOT_REPORTED"')"
-          # Only flag as a queue blocker if Tide considers it eligible (SUCCESS)
-          # but it will fail due to insufficient reviews
-          if (( _approvals < required_reviews )) && [[ "$_tide" == "SUCCESS" ]]; then
-            _short=$((required_reviews - _approvals))
-            echo "${_base}|${_num}|${_short}" >> "$review_blockers_file"
-          fi
-        done
+    failing="$(echo "$checks" | jq -r '[.[] | select(.check_state == "FAILURE" and .check_name != "tide") | .check_name] | sort | .[]')"
+    errored="$(echo "$checks" | jq -r '[.[] | select(.check_state == "ERROR" and .check_name != "tide") | .check_name] | sort | .[]')"
+    pending="$(echo "$checks" | jq -r '[.[] | select(.check_state == "PENDING" and .check_name != "tide") | .check_name] | sort | .[]')"
+    in_progress="$(echo "$checks" | jq -r '[.[] | select(.check_state == "IN_PROGRESS" and .check_name != "tide") | .check_name] | sort | .[]')"
+
+    tide_state="$(echo "$checks" | jq -r '[.[] | select(.check_name == "tide") | .check_state] | first // "NOT_REPORTED"')"
+
+    # Determine blocking labels
+    local label_blockers=()
+    for blocker_label in "do-not-merge/hold" "do-not-merge/work-in-progress" \
+      "do-not-merge/invalid-owners-file" "needs-rebase" "jira/invalid-bug" \
+      "backports/unvalidated-commits"; do
+      if echo "$pr_labels" | grep -qF "$blocker_label"; then
+        label_blockers+=("$blocker_label")
       fi
+    done
 
-      echo "$pr_json" | jq -c '.[]' | while IFS= read -r pr; do
-        pr_num="$(echo "$pr" | jq -r '.number')"
-        pr_author="$(echo "$pr" | jq -r '.author.login')"
-        pr_title="$(echo "$pr" | jq -r '.title')"
-        pr_branch="$(echo "$pr" | jq -r '.headRefName')"
-        pr_base="$(echo "$pr" | jq -r '.baseRefName')"
-        pr_labels="$(echo "$pr" | jq -r '[.labels[].name] | join(",")')"
-
-        # Check GitHub approving reviews vs required count
-        # Collapse to latest review per author (by submittedAt), then count APPROVED
-        approving_reviewers="$(echo "$pr" | jq -r '
-          [.reviews[] | {login: .author.login, state: .state, at: .submittedAt}]
-          | group_by(.login)
-          | map(sort_by(.at) | last)
-          | map(select(.state == "APPROVED") | .login)
-          | .[]')"
-        approval_count=0
-        if [[ -n "$approving_reviewers" ]]; then
-          approval_count="$(echo "$approving_reviewers" | wc -l | tr -d ' ')"
-        fi
-
-        # Normalize checks
-        checks="$(echo "$pr" | jq -c "$NORMALIZE_CHECKS_JQ")"
-
-        # Separate by state (exclude 'tide' context — it's Tide's own status, not a CI check)
-        failing="$(echo "$checks" | jq -r '[.[] | select(.check_state == "FAILURE" and .check_name != "tide") | .check_name] | sort | .[]')"
-        errored="$(echo "$checks" | jq -r '[.[] | select(.check_state == "ERROR" and .check_name != "tide") | .check_name] | sort | .[]')"
-        pending="$(echo "$checks" | jq -r '[.[] | select(.check_state == "PENDING" and .check_name != "tide") | .check_name] | sort | .[]')"
-        in_progress="$(echo "$checks" | jq -r '[.[] | select(.check_state == "IN_PROGRESS" and .check_name != "tide") | .check_name] | sort | .[]')"
-
-        # Tide status
-        tide_state="$(echo "$checks" | jq -r '[.[] | select(.check_name == "tide") | .check_state] | first // "NOT_REPORTED"')"
-
-        # Determine blocking labels
-        label_blockers=()
-        for blocker_label in "do-not-merge/hold" "do-not-merge/work-in-progress" \
-          "do-not-merge/invalid-owners-file" "needs-rebase" "jira/invalid-bug" \
-          "backports/unvalidated-commits"; do
-          if echo "$pr_labels" | grep -qF "$blocker_label"; then
-            label_blockers+=("$blocker_label")
-          fi
-        done
-
-        # Build Prow PR query URL
-        encoded_branch="$(echo "$pr_branch" | sed 's/ /%20/g; s/:/%3A/g; s|/|%2F|g')"
-        prow_pr_url="${PROW_BASE}/pr?query=is%3Apr+repo%3A${org}%2F${reponame}+author%3A${pr_author}+head%3A${encoded_branch}"
+    # Build Prow PR query URL
+    local encoded_branch prow_pr_url
+    encoded_branch="$(echo "$pr_branch" | sed 's/ /%20/g; s/:/%3A/g; s|/|%2F|g')"
+    prow_pr_url="${PROW_BASE}/pr?query=is%3Apr+repo%3A${org}%2F${reponame}+author%3A${pr_author}+head%3A${encoded_branch}"
 
         # Check if insufficient reviews will block merge (prow#134 workaround)
         missing_reviews=false
@@ -900,31 +1657,119 @@ if [[ "$SKIP_QUEUE" != "true" ]]; then
         echo ""
       done
 
-      rm -f "$review_blockers_file"
+  rm -f "$review_blockers_file"
+}
 
-      ((QUEUE_TOTAL += pr_count))
-    done
+#
+# Run merge queue check for all repos (used in text/markdown mode)
+#
+run_all_merge_queues() {
+  section "Merge Queue Status"
 
-    if [[ "$QUEUE_TOTAL" == "0" ]]; then
-      ok "No PRs stuck in merge queue across all repos"
-    fi
+  if ! command -v gh &>/dev/null; then
+    warning "gh CLI not found — skipping merge queue check (use --skip-queue to suppress)"
+    return
   fi
+
+  echo "PRs with approved+lgtm labels that haven't merged yet."
+  echo "Tide merges one PR at a time per branch per repo; others wait in queue."
+  echo ""
+
+  for repo in "${ALL_REPOS[@]}"; do
+    if ! has_config "$repo"; then continue; fi
+    check_merge_queue_repo "$repo"
+  done
+}
+
+run_audit
+
+# In non-interactive mode, run merge queue inline
+if [[ "$FORMAT" != "interactive" && "$SKIP_QUEUE" != "true" ]]; then
+  run_all_merge_queues
 fi
 
-# --- Summary ---
-section "Summary"
-echo -e "Issues:   ${RED}$ISSUES${RESET}"
-echo -e "Warnings: ${YELLOW}$WARNINGS${RESET}"
-echo -e "Info:     ${CYAN}$INFO${RESET}"
+# Launch TUI viewer if interactive mode (with refresh loop)
+if [[ "$FORMAT" == "interactive" && -n "$TUI_OUTPUT" ]]; then
+  _stop_spinner
+  exec 1>&3 3>&-
 
-if (( ISSUES > 0 )); then
-  echo ""
-  echo "Issues indicate missing or broken configuration that should be fixed."
-fi
-if (( WARNINGS > 0 )); then
-  echo ""
-  echo "Warnings indicate deviations from the expected pattern for the repo type."
-  echo "Some may be intentional — review each case."
+  # Spinners use fd 3 which is now closed — redefine to no-ops for merge queue calls
+  _show_status() { :; }
+  section() { echo ""; echo -e "${BOLD}=== $1 ===${RESET}"; }
+
+  # Track background merge queue PID
+  _MERGE_QUEUE_BG_PID=""
+
+  _kill_bg_merge_queue() {
+    if [[ -n "${_MERGE_QUEUE_BG_PID:-}" ]]; then
+      kill "$_MERGE_QUEUE_BG_PID" 2>/dev/null || true
+      wait "$_MERGE_QUEUE_BG_PID" 2>/dev/null || true
+      _MERGE_QUEUE_BG_PID=""
+    fi
+  }
+
+  while true; do
+    tui_viewer "$TUI_OUTPUT"
+
+    _kill_bg_merge_queue
+
+    case "${_TUI_ACTION:-quit}" in
+      refresh)
+        # Clear cache for refresh
+        if [[ -n "${_REFRESH_REPO:-}" ]]; then
+          rm -rf "$CACHE_DIR/${_REFRESH_REPO%%/*}/${_REFRESH_REPO##*/}" 2>/dev/null || true
+        else
+          find "$CACHE_DIR" -name "*.yaml" -delete 2>/dev/null || true
+          find "$CACHE_DIR" -name "*.404" -delete 2>/dev/null || true
+        fi
+
+        # Re-run audit with output captured (re-enable spinners on fd 3)
+        : > "$TUI_OUTPUT"
+        exec 3>&1 1>"$TUI_OUTPUT"
+        section() { _stop_spinner; echo ""; echo -e "${BOLD}=== $1 ===${RESET}"; _start_spinner "$1"; }
+        fetch_rate_limit
+        _start_spinner "Refreshing audit"
+        run_audit
+        _stop_spinner
+        exec 1>&3 3>&-
+        # Restore no-op overrides (fd 3 closed again)
+        _show_status() { :; }
+        section() { echo ""; echo -e "${BOLD}=== $1 ===${RESET}"; }
+        ;;
+      merge_queue)
+        # Single-repo merge queue check: append results to output file
+        if [[ -n "${_MERGE_QUEUE_REPO:-}" ]]; then
+          (
+            echo ""
+            echo -e "${BOLD}=== Merge Queue: ${_MERGE_QUEUE_REPO} ===${RESET}"
+            check_merge_queue_repo "${_MERGE_QUEUE_REPO}"
+          ) >> "$TUI_OUTPUT"
+        fi
+        ;;
+      merge_queue_all)
+        # All-repo merge queue check: run in background, append results progressively
+        (
+          echo ""
+          echo -e "${BOLD}=== Merge Queue Status ===${RESET}"
+          echo "PRs with approved+lgtm labels that haven't merged yet."
+          echo "Tide merges one PR at a time per branch per repo; others wait in queue."
+          echo ""
+          for repo in "${ALL_REPOS[@]}"; do
+            if ! has_config "$repo"; then continue; fi
+            check_merge_queue_repo "$repo"
+          done
+          echo "Merge queue check complete."
+        ) >> "$TUI_OUTPUT" &
+        _MERGE_QUEUE_BG_PID=$!
+        disown "$_MERGE_QUEUE_BG_PID" 2>/dev/null || true
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  _kill_bg_merge_queue
 fi
 
 exit 0

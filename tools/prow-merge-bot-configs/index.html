@@ -58,6 +58,7 @@
       display: flex; align-items: center; justify-content: space-between; user-select: none;
     }
     .section-hdr:hover { background: rgba(255,255,255,.02); }
+    .section-hdr:focus-visible { outline: 2px solid var(--blue); outline-offset: -2px; }
     .section-hdr .arrow { transition: transform .2s; color: var(--muted); font-size: .7rem; }
     .section.collapsed .section-body { display: none; }
     .section.collapsed .arrow { transform: rotate(-90deg); }
@@ -85,6 +86,37 @@
     .chk { display: inline-flex; align-items: center; gap: .2rem; font-size: .75rem; margin: .1rem .3rem; }
     .progress-msg { color: var(--blue); font-size: .85rem; padding: 1rem; }
     .none { color: var(--muted); font-style: italic; }
+    .btn-sm {
+      background: var(--surface2); color: var(--text); border: 1px solid var(--border);
+      padding: .2rem .6rem; border-radius: 4px; font-size: .7rem; font-weight: 600;
+      cursor: pointer; vertical-align: middle;
+    }
+    .btn-sm:hover { background: var(--border); }
+    .btn-sm:disabled { opacity: .5; cursor: not-allowed; }
+    .btn-check-all {
+      background: #238636; color: #fff; border: none; padding: .25rem .75rem;
+      border-radius: 4px; font-size: .7rem; font-weight: 600; cursor: pointer;
+      margin-left: .5rem;
+    }
+    .btn-check-all:hover { background: #2ea043; }
+    .btn-check-all:disabled { opacity: .5; cursor: not-allowed; }
+    .queue-result { margin-top: .3rem; }
+    .rate-pill {
+      position: fixed; top: 1rem; right: 1rem; z-index: 999;
+      background: rgba(22,27,34,.95); border: 1px solid var(--border); border-radius: 6px;
+      padding: .3rem .7rem; font-size: .75rem; color: var(--muted);
+      box-shadow: 0 2px 8px rgba(0,0,0,.4);
+    }
+    .rate-banner {
+      background: rgba(30,10,10,.95); border: 1px solid var(--red); color: var(--red);
+      padding: .6rem 1rem; border-radius: 8px; font-size: .85rem;
+      display: none; align-items: center; gap: .5rem;
+      position: fixed; top: 1rem; left: 50%; transform: translateX(-50%);
+      max-width: 800px; width: calc(100% - 2rem); z-index: 1000;
+      box-shadow: 0 4px 12px rgba(0,0,0,.5);
+    }
+    .rate-banner.visible { display: flex; }
+    .rate-banner .dismiss { margin-left: auto; cursor: pointer; background: none; border: none; color: var(--red); font-size: 1rem; padding: 0 .3rem; }
     @media (max-width: 768px) {
       body { padding: 1rem; }
       .controls { flex-direction: column; align-items: stretch; }
@@ -101,11 +133,17 @@
     <div class="controls">
       <input type="password" id="token" placeholder="GitHub token (optional, raises API rate limit)" size="45">
       <label>openshift/release branch: <select id="branch"><option value="main">main</option></select></label>
-      <label><input type="checkbox" id="includeQueue" checked> Merge queue</label>
       <button id="runBtn" onclick="runAudit()">Run Audit</button>
     </div>
-    <div class="hint">Token stored in sessionStorage only. Required for merge queue checks (GitHub API, 60 req/hr without token). Token needs <code>public_repo</code> scope (classic) or <code>repo:status</code> + <code>read:org</code> (<a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer">fine-grained</a>).</div>
+    <div class="hint">Token stored in sessionStorage only. Merge queue checks use the GitHub API (60 req/hr without token, 5000 with).
+      Token needs <code>public_repo</code> scope (classic) or <code>repo:status</code> + <code>read:org</code> (fine-grained).
+      <button onclick="window.open('https://github.com/settings/personal-access-tokens/new','_blank')" style="background:var(--surface2);color:var(--text);border:1px solid var(--border);padding:.15rem .5rem;border-radius:4px;font-size:.7rem;cursor:pointer;vertical-align:middle">Get token</button></div>
   </header>
+  <div class="rate-pill" id="rate-counter" aria-label="GitHub API rate limit counter"></div>
+  <div class="rate-banner" id="rate-banner">
+    <span class="rate-msg">Rate limited. GitHub API limit exceeded. Provide a token to raise the limit to 5,000 req/hr.</span>
+    <button class="dismiss" aria-label="Dismiss rate limit warning" onclick="document.getElementById('rate-banner').classList.remove('visible')">&times;</button>
+  </div>
   <div id="app"></div>
 
   <script src="https://cdn.jsdelivr.net/npm/js-yaml@4.1.0/dist/js-yaml.min.js"
@@ -150,16 +188,146 @@ const GROUPS = {
   }
 };
 
-const BLOCKER_LABELS = [
-  'do-not-merge/hold','do-not-merge/work-in-progress','do-not-merge/invalid-owners-file',
-  'needs-rebase','jira/invalid-bug','backports/unvalidated-commits',
-];
-
 // ── State ──────────────────────────────────────────────────────
 let cfgs = {};       // { 'org/repo': { plugin: obj|null, prow: obj|null } }
 let results = [];    // { repo, level, msg }
 let counts = { issues: 0, warnings: 0, info: 0 };
-let queue = [];
+let queue = {};      // { 'org/repo': entry }
+let auditDone = false;
+
+// ── Rate Limit Tracking ──────────────────────────────────────
+const RL_STORAGE_KEY = 'prow-audit-ratelimit';
+
+function loadRateLimit() {
+  try {
+    const saved = localStorage.getItem(RL_STORAGE_KEY);
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      // Discard if the reset window has passed
+      if (parsed.resetEpoch && Math.floor(Date.now() / 1000) < parsed.resetEpoch) return parsed;
+    }
+  } catch {}
+  return { used: 0, limit: 60, remaining: 60, resetEpoch: 0 };
+}
+
+function saveRateLimit() {
+  try { localStorage.setItem(RL_STORAGE_KEY, JSON.stringify(rateLimit)); } catch {}
+}
+
+let rateLimit = loadRateLimit();
+
+async function apiFetch(url, opts) {
+  updateRateDisplay();
+  const resp = await fetch(url, opts);
+  // Update from GitHub's actual rate limit headers
+  const rlLimit = resp.headers.get('X-RateLimit-Limit');
+  const rlRemaining = resp.headers.get('X-RateLimit-Remaining');
+  const rlUsed = resp.headers.get('X-RateLimit-Used');
+  const rlReset = resp.headers.get('X-RateLimit-Reset');
+  if (rlLimit !== null) {
+    const pInt = (v, fallback) => { const n = parseInt(v); return isNaN(n) ? fallback : n; };
+    rateLimit.limit = pInt(rlLimit, rateLimit.limit);
+    rateLimit.remaining = pInt(rlRemaining, rateLimit.remaining);
+    rateLimit.used = pInt(rlUsed, rateLimit.used);
+    rateLimit.resetEpoch = pInt(rlReset, rateLimit.resetEpoch);
+    saveRateLimit();
+  }
+  updateRateDisplay();
+  if (resp.status === 403) {
+    const banner = document.getElementById('rate-banner');
+    if (banner) {
+      const resetTime = rateLimit.resetEpoch ? new Date(rateLimit.resetEpoch * 1000).toLocaleTimeString() : 'unknown';
+      banner.querySelector('.rate-msg').textContent =
+        `Rate limited. GitHub API limit exceeded. Resets at ${resetTime}. Provide a token to raise the limit to 5,000 req/hr.`;
+      banner.classList.add('visible');
+    }
+  }
+  return resp;
+}
+
+function updateRateDisplay() {
+  const el = document.getElementById('rate-counter');
+  if (!el) return;
+  // If reset window has passed, clear stored state
+  if (rateLimit.resetEpoch && Math.floor(Date.now() / 1000) >= rateLimit.resetEpoch) {
+    rateLimit = { used: 0, limit: rateLimit.limit, remaining: rateLimit.limit, resetEpoch: 0 };
+    saveRateLimit();
+  }
+  const used = rateLimit.used;
+  const limit = rateLimit.limit;
+  let resetStr = '';
+  if (rateLimit.resetEpoch) {
+    const secsLeft = Math.max(0, rateLimit.resetEpoch - Math.floor(Date.now() / 1000));
+    const mins = Math.ceil(secsLeft / 60);
+    const resetTime = new Date(rateLimit.resetEpoch * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    resetStr = `resets in ${mins}m at ${resetTime}`;
+  }
+  const color = rateLimit.remaining <= 0 ? 'var(--red)' : rateLimit.remaining <= limit * 0.2 ? 'var(--yellow)' : 'var(--muted)';
+  const notifyPending = !!localStorage.getItem(NOTIFY_KEY);
+  let notifyBtn = '';
+  if (rateLimit.remaining <= 0 && rateLimit.resetEpoch) {
+    notifyBtn = notifyPending
+      ? ` <button class="btn-sm" id="notify-btn" disabled>Scheduled</button>`
+      : ` <button class="btn-sm" onclick="scheduleResetNotify()" id="notify-btn" title="Get notified when rate limit resets">Notify me</button>`;
+  }
+  el.innerHTML = `<span style="color:${color}">${used}/${limit}</span> API reqs${resetStr ? ` (${resetStr})` : ''}${notifyBtn}`;
+}
+
+let resetNotifyTimer = null;
+const NOTIFY_KEY = 'prow-audit-notify-reset';
+
+function scheduleResetNotify() {
+  if (!rateLimit.resetEpoch) return;
+  // Request permission if needed
+  if (Notification.permission === 'default') {
+    Notification.requestPermission().then(p => { if (p === 'granted') scheduleResetNotify(); });
+    return;
+  }
+  if (Notification.permission !== 'granted') {
+    alert('Notification permission denied. Enable it in your browser settings.');
+    return;
+  }
+  // Persist so it survives refresh/reopen
+  localStorage.setItem(NOTIFY_KEY, String(rateLimit.resetEpoch));
+  startNotifyTimer(rateLimit.resetEpoch);
+}
+
+function startNotifyTimer(resetEpoch) {
+  if (resetNotifyTimer) clearTimeout(resetNotifyTimer);
+  const msLeft = resetEpoch * 1000 - Date.now();
+  const btn = document.getElementById('notify-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Scheduled'; }
+  if (msLeft <= 0) {
+    // Already passed — fire now
+    fireResetNotification();
+    return;
+  }
+  resetNotifyTimer = setTimeout(fireResetNotification, msLeft);
+}
+
+function fireResetNotification() {
+  localStorage.removeItem(NOTIFY_KEY);
+  resetNotifyTimer = null;
+  if (Notification.permission === 'granted') {
+    new Notification('GitHub API rate limit reset', {
+      body: 'Your rate limit has reset. You can resume merge queue checks.',
+      icon: 'https://github.githubassets.com/favicons/favicon.svg',
+    });
+  }
+  rateLimit = { used: 0, limit: rateLimit.limit, remaining: rateLimit.limit, resetEpoch: 0 };
+  saveRateLimit();
+  updateRateDisplay();
+  const banner = document.getElementById('rate-banner');
+  if (banner) banner.classList.remove('visible');
+}
+
+function restoreNotifyTimer() {
+  const saved = localStorage.getItem(NOTIFY_KEY);
+  if (!saved) return;
+  const resetEpoch = parseInt(saved);
+  if (isNaN(resetEpoch)) { localStorage.removeItem(NOTIFY_KEY); return; }
+  startNotifyTimer(resetEpoch);
+}
 
 // ── Helpers ────────────────────────────────────────────────────
 const split = n => { const [o, r] = n.split('/'); return { org: o, repo: r }; };
@@ -252,6 +420,12 @@ function tideBranches(n) {
   return [];
 }
 
+function tideRequiredLabels(n) {
+  const qs = cfgs[n]?.prow?.tide?.queries || [];
+  for (const q of qs) { if (q.repos?.includes(n)) return q.labels || []; }
+  return ['approved', 'lgtm']; // fallback
+}
+
 function tideMissingLabels(n) {
   const qs = cfgs[n]?.prow?.tide?.queries || [];
   for (const q of qs) { if (q.repos?.includes(n)) return q.missingLabels || []; }
@@ -337,13 +511,16 @@ async function checkMergeQueue(repos) {
     if (!hasConfig(name)) continue;
     log(`Checking merge queue: ${name}...`);
     try {
-      const resp = await fetch(`${API}/repos/${name}/pulls?state=open&per_page=100`, { headers: h });
+      const requiredLabels = tideRequiredLabels(name);
+      const blockerLabels = tideMissingLabels(name);
+
+      const resp = await apiFetch(`${API}/repos/${name}/pulls?state=open&per_page=100`, { headers: h });
       if (resp.status === 403) { out.push({ repo: name, error: 'Rate limited — provide a GitHub token' }); break; }
-      if (!resp.ok) continue;
+      if (!resp.ok) { out.push({ repo: name, error: `API error ${resp.status}` }); continue; }
       const prs = await resp.json();
       const matched = prs.filter(p => {
         const lbls = p.labels.map(l => l.name);
-        return lbls.includes('approved') && lbls.includes('lgtm');
+        return requiredLabels.every(rl => lbls.includes(rl));
       });
       if (!matched.length) continue;
 
@@ -354,9 +531,9 @@ async function checkMergeQueue(repos) {
 
       for (const pr of matched) {
         const [revResp, chkResp, stResp] = await Promise.all([
-          fetch(`${API}/repos/${name}/pulls/${pr.number}/reviews`, { headers: h }),
-          fetch(`${API}/repos/${name}/commits/${pr.head.sha}/check-runs?per_page=100`, { headers: h }),
-          fetch(`${API}/repos/${name}/commits/${pr.head.sha}/status`, { headers: h }),
+          apiFetch(`${API}/repos/${name}/pulls/${pr.number}/reviews`, { headers: h }),
+          apiFetch(`${API}/repos/${name}/commits/${pr.head.sha}/check-runs?per_page=100`, { headers: h }),
+          apiFetch(`${API}/repos/${name}/commits/${pr.head.sha}/status`, { headers: h }),
         ]);
         const reviews = revResp.ok ? await revResp.json() : [];
         const chkData = chkResp.ok ? await chkResp.json() : { check_runs: [] };
@@ -394,7 +571,7 @@ async function checkMergeQueue(repos) {
         const tide = checks.find(c => c.name === 'tide');
         const tideBlocked = tide && !['SUCCESS', 'PENDING'].includes(tide.state);
         const prLabels = pr.labels.map(l => l.name);
-        const blockerLabels = BLOCKER_LABELS.filter(b => prLabels.includes(b));
+        const prBlockerLabels = blockerLabels.filter(b => prLabels.includes(b));
 
         let missingReviews = false, reviewsShort = 0;
         const reqNum = parseInt(reqReviews);
@@ -403,14 +580,14 @@ async function checkMergeQueue(repos) {
           reviewsShort = reqNum - approvers.size;
         }
 
-        const hasBlockers = blockerLabels.length > 0 || failing.length > 0 || errored.length > 0
+        const hasBlockers = prBlockerLabels.length > 0 || failing.length > 0 || errored.length > 0
           || pending.length > 0 || running.length > 0 || missingReviews || tideBlocked;
 
         const encBranch = encodeURIComponent(pr.head.ref);
         details.push({
           number: pr.number, title: pr.title, author: pr.user.login,
           branch: pr.head.ref, base: pr.base.ref, url: pr.html_url, labels: prLabels,
-          blockerLabels, approvalCount: approvers.size,
+          blockerLabels: prBlockerLabels, approvalCount: approvers.size,
           requiredReviews: isNaN(reqNum) ? null : reqNum, enforce,
           missingReviews, reviewsShort,
           failing, errored, pending, running,
@@ -420,7 +597,7 @@ async function checkMergeQueue(repos) {
       }
 
       out.push({
-        repo: name, count: matched.length, reqReviews, enforce, prs: details,
+        repo: name, count: matched.length, requiredLabels, reqReviews, enforce, prs: details,
         tideUrl: `${PROW}/tide?query=is%3Apr+state%3Aopen+repo%3A${org}%2F${repo}`,
       });
     } catch (e) { out.push({ repo: name, error: e.message }); }
@@ -428,10 +605,56 @@ async function checkMergeQueue(repos) {
   return out;
 }
 
+let queueCheckInProgress = false;
+
+async function checkRepoQueue(repoName) {
+  if (queueCheckInProgress) return;
+  queueCheckInProgress = true;
+  const btn = document.getElementById(`q-${repoName.replace('/', '-')}`);
+  if (btn) { btn.disabled = true; btn.textContent = 'Checking...'; }
+  try {
+    const result = await checkMergeQueue([repoName]);
+    if (result.length) {
+      queue[repoName] = result[0];
+    } else {
+      queue[repoName] = { repo: repoName, count: 0, prs: [], noMatches: true, requiredLabels: tideRequiredLabels(repoName) };
+    }
+  } catch (e) {
+    queue[repoName] = { repo: repoName, error: e.message };
+  } finally {
+    queueCheckInProgress = false;
+    renderQueue();
+  }
+}
+
+async function checkAllQueues() {
+  if (queueCheckInProgress) return;
+  queueCheckInProgress = true;
+  const btn = document.getElementById('check-all-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Checking all...'; }
+  const all = Object.values(GROUPS).flatMap(g => g.repos).filter(r => hasConfig(r));
+  for (const name of all) {
+    const repoBtn = document.getElementById(`q-${name.replace('/', '-')}`);
+    if (repoBtn) { repoBtn.disabled = true; repoBtn.textContent = 'Checking...'; }
+  }
+  try {
+    const results = await checkMergeQueue(all);
+    for (const entry of results) queue[entry.repo] = entry;
+    for (const name of all) {
+      if (!queue[name]) queue[name] = { repo: name, count: 0, prs: [], noMatches: true, requiredLabels: tideRequiredLabels(name) };
+    }
+  } catch (e) {
+    // partial results are kept
+  } finally {
+    queueCheckInProgress = false;
+    renderQueue();
+  }
+}
+
 // ── Rendering ──────────────────────────────────────────────────
 function sec(title, desc, content, collapsed) {
   return `<div class="section${collapsed ? ' collapsed' : ''}">
-    <div class="section-hdr" onclick="this.parentElement.classList.toggle('collapsed')">
+    <div class="section-hdr" role="button" tabindex="0" aria-expanded="${collapsed ? 'false' : 'true'}" onclick="this.parentElement.classList.toggle('collapsed');this.setAttribute('aria-expanded',this.getAttribute('aria-expanded')==='true'?'false':'true')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click()}">
       <span>${title}</span><span class="arrow">&#9660;</span>
     </div>
     <div class="section-body">${desc ? `<div class="section-desc">${desc}</div>` : ''}${content}</div>
@@ -501,96 +724,133 @@ function render() {
   }
   h += sec('Tide Branch Coverage', 'Branches included in Tide merge queries', bc, true);
 
-  // Merge queue
-  if (queue.length) {
-    let qc = '', total = 0;
-    for (const entry of queue) {
-      if (entry.error) {
-        qc += `<div class="entry">${badge('warn','error')} <span class="repo">${esc(entry.repo)}</span>: ${esc(entry.error)}</div>`;
-        continue;
-      }
-      total += entry.count;
-      qc += `<div class="entry"><span class="repo">${esc(entry.repo)}</span> (${entry.count} PRs with approved+lgtm)`;
-      if (entry.reqReviews !== 'NOT_SET' && entry.reqReviews !== 'MISSING_FILE')
-        qc += ` — Required reviews: ${esc(entry.reqReviews)} (enforce_admins: ${esc(entry.enforce)})`;
-      qc += ` <a href="${safeHref(entry.tideUrl)}" target="_blank" rel="noopener noreferrer">Tide</a>`;
-
-      // Pre-compute review blockers per branch for this repo
-      const reviewBlockersByBranch = {};
-      if (entry.enforce === 'true' && entry.prs[0]?.requiredReviews) {
-        for (const pr of entry.prs) {
-          if (pr.missingReviews && pr.tide === 'SUCCESS') {
-            if (!reviewBlockersByBranch[pr.base]) reviewBlockersByBranch[pr.base] = [];
-            reviewBlockersByBranch[pr.base].push(pr);
-          }
-        }
-      }
-
-      for (const pr of entry.prs) {
-        const color = pr.hasBlockers ? 'var(--red)' : 'var(--green)';
-        qc += `<div class="pr-card">
-          <div class="pr-title" style="color:${color}">
-            <a href="${safeHref(pr.url)}" target="_blank" rel="noopener noreferrer">#${pr.number}</a> [${esc(pr.base)}] ${esc(pr.title)}
-          </div>
-          <div class="pr-meta">Author: ${esc(pr.author)} · <a href="${safeHref(pr.prowUrl)}" target="_blank" rel="noopener noreferrer">Prow</a></div>
-          <div class="pr-checks">`;
-
-        for (const lbl of pr.blockerLabels)
-          qc += `<div class="chk">${badge('issue','BLOCKED')} ${esc(lbl)}</div>`;
-
-        if (pr.missingReviews) {
-          qc += `<div class="chk">${badge('issue','REVIEWS')} ${pr.approvalCount}/${pr.requiredReviews} approvals (need ${pr.reviewsShort} more)</div>`;
-          qc += `<div class="chk" style="color:var(--yellow)">Tide will attempt merge but GitHub will reject (enforce_admins + prow#134)</div>`;
-        } else if (pr.requiredReviews !== null) {
-          qc += `<div class="chk">${badge('ok','REVIEWS')} ${pr.approvalCount}/${pr.requiredReviews} approvals</div>`;
-        }
-
-        for (const c of pr.failing) qc += `<div class="chk">${badge('issue','FAILED')} ${esc(c.name)}</div>`;
-        for (const c of pr.errored) qc += `<div class="chk">${badge('issue','ERROR')} ${esc(c.name)}</div>`;
-        for (const c of pr.running) qc += `<div class="chk">${badge('warn','RUNNING')} ${esc(c.name)}</div>`;
-
-        if (pr.pending.length <= 5) {
-          for (const c of pr.pending) qc += `<div class="chk">${badge('warn','PENDING')} ${esc(c.name)}</div>`;
-        } else {
-          for (const c of pr.pending.slice(0, 3)) qc += `<div class="chk">${badge('warn','PENDING')} ${esc(c.name)}</div>`;
-          qc += `<div class="chk">${badge('warn','PENDING')} ... and ${pr.pending.length - 3} more</div>`;
-        }
-
-        if (pr.tideBlocked)
-          qc += `<div class="chk">${badge('issue','TIDE')} ${esc(pr.tide)}</div>`;
-        else if (pr.tide === 'SUCCESS')
-          qc += `<div class="chk">${badge('ok','TIDE')} merge criteria met — merging soon</div>`;
-        else if (pr.tide === 'PENDING') {
-          // Check if review-blocked PRs ahead on same branch
-          const branchBlockers = (reviewBlockersByBranch[pr.base] || [])
-            .filter(b => b.number !== pr.number)
-            .map(b => `<a href="${safeHref(b.url)}" target="_blank" rel="noopener noreferrer">#${b.number}</a> (needs ${b.reviewsShort} more review(s))`);
-          if (branchBlockers.length)
-            qc += `<div class="chk">${badge('info','TIDE')} waiting — review-blocked PRs ahead: ${branchBlockers.join(', ')}</div>`;
-          else
-            qc += `<div class="chk">${badge('info','TIDE')} waiting (another PR may be testing ahead in queue)</div>`;
-        }
-
-        if (!pr.hasBlockers) {
-          const branchBlockers = (reviewBlockersByBranch[pr.base] || [])
-            .filter(b => b.number !== pr.number)
-            .map(b => `<a href="${safeHref(b.url)}" target="_blank" rel="noopener noreferrer">#${b.number}</a> (needs ${b.reviewsShort} more review(s))`);
-          if (branchBlockers.length)
-            qc += `<div class="chk">${badge('ok','READY')} All checks passed — but review-blocked PRs may delay merge: ${branchBlockers.join(', ')}</div>`;
-          else
-            qc += `<div class="chk">${badge('ok','READY')} All checks passed, no blocking labels — merge imminent</div>`;
-        }
-
-        qc += '</div></div>';
-      }
-      qc += '</div>';
-    }
-    if (total === 0) qc = `<div class="entry">${badge('ok','OK')} No PRs stuck in merge queue</div>`;
-    h += sec('Merge Queue Status', 'PRs with approved+lgtm labels that haven\'t merged yet. Tide merges one PR at a time per branch per repo.', qc);
-  }
+  // Merge queue section (always shown after audit, with per-repo buttons)
+  h += `<div id="queue-section"></div>`;
 
   document.getElementById('app').innerHTML = h;
+  renderQueue();
 }
+
+function renderQueueEntry(entry) {
+  let qc = '';
+  if (entry.error) {
+    return `<div class="entry">${badge('warn','error')} <span class="repo">${esc(entry.repo)}</span>: ${esc(entry.error)}</div>`;
+  }
+  if (entry.noMatches) {
+    const lblStr = (entry.requiredLabels || ['approved','lgtm']).join('+');
+    return `<div class="entry">${badge('ok','OK')} <span class="repo">${esc(entry.repo)}</span>: No PRs with ${esc(lblStr)}</div>`;
+  }
+
+  const { org, repo } = split(entry.repo);
+  const lblStr = (entry.requiredLabels || ['approved','lgtm']).join('+');
+  qc += `<div class="entry"><span class="repo">${esc(entry.repo)}</span> (${entry.count} PRs with ${esc(lblStr)})`;
+  if (entry.reqReviews !== 'NOT_SET' && entry.reqReviews !== 'MISSING_FILE')
+    qc += ` — Required reviews: ${esc(entry.reqReviews)} (enforce_admins: ${esc(entry.enforce)})`;
+  qc += ` <a href="${safeHref(entry.tideUrl)}" target="_blank" rel="noopener noreferrer">Tide</a>`;
+
+  // Pre-compute review blockers per branch for this repo
+  const reviewBlockersByBranch = {};
+  if (entry.enforce === 'true' && entry.prs[0]?.requiredReviews) {
+    for (const pr of entry.prs) {
+      if (pr.missingReviews && pr.tide === 'SUCCESS') {
+        if (!reviewBlockersByBranch[pr.base]) reviewBlockersByBranch[pr.base] = [];
+        reviewBlockersByBranch[pr.base].push(pr);
+      }
+    }
+  }
+
+  for (const pr of entry.prs) {
+    const color = pr.hasBlockers ? 'var(--red)' : 'var(--green)';
+    qc += `<div class="pr-card">
+      <div class="pr-title" style="color:${color}">
+        <a href="${safeHref(pr.url)}" target="_blank" rel="noopener noreferrer">#${pr.number}</a> [${esc(pr.base)}] ${esc(pr.title)}
+      </div>
+      <div class="pr-meta">Author: ${esc(pr.author)} · <a href="${safeHref(pr.prowUrl)}" target="_blank" rel="noopener noreferrer">Prow</a></div>
+      <div class="pr-checks">`;
+
+    for (const lbl of pr.blockerLabels)
+      qc += `<div class="chk">${badge('issue','BLOCKED')} ${esc(lbl)}</div>`;
+
+    if (pr.missingReviews) {
+      qc += `<div class="chk">${badge('issue','REVIEWS')} ${pr.approvalCount}/${pr.requiredReviews} approvals (need ${pr.reviewsShort} more)</div>`;
+      qc += `<div class="chk" style="color:var(--yellow)">Tide will attempt merge but GitHub will reject (enforce_admins + prow#134)</div>`;
+    } else if (pr.requiredReviews !== null) {
+      qc += `<div class="chk">${badge('ok','REVIEWS')} ${pr.approvalCount}/${pr.requiredReviews} approvals</div>`;
+    }
+
+    for (const c of pr.failing) qc += `<div class="chk">${badge('issue','FAILED')} ${esc(c.name)}</div>`;
+    for (const c of pr.errored) qc += `<div class="chk">${badge('issue','ERROR')} ${esc(c.name)}</div>`;
+    for (const c of pr.running) qc += `<div class="chk">${badge('warn','RUNNING')} ${esc(c.name)}</div>`;
+
+    if (pr.pending.length <= 5) {
+      for (const c of pr.pending) qc += `<div class="chk">${badge('warn','PENDING')} ${esc(c.name)}</div>`;
+    } else {
+      for (const c of pr.pending.slice(0, 3)) qc += `<div class="chk">${badge('warn','PENDING')} ${esc(c.name)}</div>`;
+      qc += `<div class="chk">${badge('warn','PENDING')} ... and ${pr.pending.length - 3} more</div>`;
+    }
+
+    if (pr.tideBlocked)
+      qc += `<div class="chk">${badge('issue','TIDE')} ${esc(pr.tide)}</div>`;
+    else if (pr.tide === 'SUCCESS')
+      qc += `<div class="chk">${badge('ok','TIDE')} merge criteria met — merging soon</div>`;
+    else if (pr.tide === 'PENDING') {
+      const branchBlockers = (reviewBlockersByBranch[pr.base] || [])
+        .filter(b => b.number !== pr.number)
+        .map(b => `<a href="${safeHref(b.url)}" target="_blank" rel="noopener noreferrer">#${b.number}</a> (needs ${b.reviewsShort} more review(s))`);
+      if (branchBlockers.length)
+        qc += `<div class="chk">${badge('info','TIDE')} waiting — review-blocked PRs ahead: ${branchBlockers.join(', ')}</div>`;
+      else
+        qc += `<div class="chk">${badge('info','TIDE')} waiting (another PR may be testing ahead in queue)</div>`;
+    }
+
+    if (!pr.hasBlockers) {
+      const branchBlockers = (reviewBlockersByBranch[pr.base] || [])
+        .filter(b => b.number !== pr.number)
+        .map(b => `<a href="${safeHref(b.url)}" target="_blank" rel="noopener noreferrer">#${b.number}</a> (needs ${b.reviewsShort} more review(s))`);
+      if (branchBlockers.length)
+        qc += `<div class="chk">${badge('ok','READY')} All checks passed — but review-blocked PRs may delay merge: ${branchBlockers.join(', ')}</div>`;
+      else
+        qc += `<div class="chk">${badge('ok','READY')} All checks passed, no blocking labels — merge imminent</div>`;
+    }
+
+    qc += '</div></div>';
+  }
+  qc += '</div>';
+  return qc;
+}
+
+function renderQueue() {
+  const el = document.getElementById('queue-section');
+  if (!el || !auditDone) return;
+
+  const all = Object.values(GROUPS).flatMap(g => g.repos).filter(r => hasConfig(r));
+  let qc = '';
+
+  for (const name of all) {
+    const btnId = `q-${name.replace('/', '-')}`;
+    const entry = queue[name];
+    if (entry) {
+      qc += renderQueueEntry(entry);
+      qc += `<div class="entry"><button class="btn-sm queue-btn" id="${btnId}" data-repo="${esc(name)}">Refresh</button></div>`;
+    } else {
+      qc += `<div class="entry"><span class="repo">${esc(name)}</span> `
+        + `<button class="btn-sm queue-btn" id="${btnId}" data-repo="${esc(name)}">Check queue</button></div>`;
+    }
+  }
+
+  const title = `Merge Queue Status <button class="btn-check-all" id="check-all-btn">Check all</button>`;
+  el.innerHTML = sec(title,
+    'PRs with all required Tide labels that haven\'t merged yet. Click per-repo or "Check all" (uses GitHub API). Without a token the limit is 60 req/hr — only check repos you need.',
+    qc);
+
+}
+
+// Delegate queue button clicks on the app container (bound once)
+document.addEventListener('click', e => {
+  const qBtn = e.target.closest('.queue-btn');
+  if (qBtn) { checkRepoQueue(qBtn.dataset.repo); return; }
+  if (e.target.closest('#check-all-btn')) { checkAllQueues(); return; }
+});
 
 // ── Main ───────────────────────────────────────────────────────
 async function runAudit() {
@@ -598,9 +858,9 @@ async function runAudit() {
   btn.disabled = true; btn.textContent = 'Running...';
   document.getElementById('app').innerHTML = '<div id="progress" class="progress-msg">Starting audit...</div>';
 
-  cfgs = {}; results = []; counts = { issues: 0, warnings: 0, info: 0 }; queue = [];
+  cfgs = {}; results = []; counts = { issues: 0, warnings: 0, info: 0 }; queue = {};
+  auditDone = false;
   const branch = document.getElementById('branch').value;
-  const includeQueue = document.getElementById('includeQueue').checked;
 
   try {
     await fetchAllConfigs(branch);
@@ -612,12 +872,7 @@ async function runAudit() {
       for (const repo of group.repos) auditRepo(repo, type);
     }
 
-    // Merge queue
-    if (includeQueue) {
-      const all = Object.values(GROUPS).flatMap(g => g.repos);
-      queue = await checkMergeQueue(all);
-    }
-
+    auditDone = true;
     render();
 
     // Save token
@@ -630,10 +885,14 @@ async function runAudit() {
   }
 }
 
-// Restore token
+// Restore token, rate display, and pending notification
 window.addEventListener('DOMContentLoaded', () => {
   const saved = sessionStorage.getItem('prow-audit-token');
   if (saved) document.getElementById('token').value = saved;
+  updateRateDisplay();
+  restoreNotifyTimer();
+  // Refresh the reset countdown every minute
+  setInterval(updateRateDisplay, 60000);
 });
   </script>
 </body>
